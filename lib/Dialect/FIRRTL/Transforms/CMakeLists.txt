@@ -60,6 +60,9 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   SpecializeOption.cpp
   VBToBV.cpp
   Vectorization.cpp
+  PowerAnalyze.cpp
+  NameUnnamedSignals.cpp
+  
 
   DEPENDS
   CIRCTFIRRTLTransformsIncGen

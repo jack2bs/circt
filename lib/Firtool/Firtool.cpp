@@ -18,6 +18,7 @@
 #include "circt/Support/Passes.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Path.h"
 
@@ -91,6 +92,10 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   // Width inference creates canonicalization opportunities.
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInferWidths());
+
+  if (opt.shouldNameUnnamedSignals()) {
+    pm.nest<firrtl::CircuitOp>().addPass(firrtl::createNameUnnamedSignals());
+  }
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createMemToRegOfVec(
       {/*replSeqMem=*/opt.shouldReplaceSequentialMemories(),
@@ -299,6 +304,10 @@ LogicalResult firtool::populateLowFIRRTLToHW(mlir::PassManager &pm,
   // Run the verif op verification pass
   pm.addNestedPass<hw::HWModuleOp>(verif::createVerifyClockedAssertLikePass());
 
+  if (opt.shouldRunPowerAnalysis()) {
+    pm.nest<firrtl::CircuitOp>().addPass(firrtl::createPowerAnalyze({opt.getPowerAnalyzeVcd()}));
+  }
+
   return success();
 }
 
@@ -459,6 +468,24 @@ struct FirtoolCmdOptions {
       llvm::cl::desc("Output filename, or directory for split output"),
       llvm::cl::value_desc("filename"),
       llvm::cl::init("-"),
+  };
+
+  llvm::cl::opt<bool> nameUnnamedSignals{
+      "name-unnamed-signals",
+      llvm::cl::desc("Give names to all unnamed signals in the design"),
+      llvm::cl::init(false)
+  };
+
+  llvm::cl::opt<bool> runPowerAnalysis{
+      "run-power-analysis",
+      llvm::cl::desc("Run power analysis on the design"),
+      llvm::cl::init(false),
+  };
+
+  llvm::cl::opt<std::string> powerAnalyzeVcd{
+      "power-analyze-vcd",
+      llvm::cl::desc("VCD file to use for power analysis"),
+      llvm::cl::init(""),
   };
 
   llvm::cl::opt<bool> disableAnnotationsUnknown{
@@ -775,7 +802,8 @@ void circt::firtool::registerFirtoolCLOptions() {
 
 // Initialize the firtool options with defaults supplied by the cl::opts above.
 circt::firtool::FirtoolOptions::FirtoolOptions()
-    : outputFilename("-"), disableAnnotationsUnknown(false),
+    : outputFilename("-"), nameUnnamedSignals(false), runPowerAnalysis(false),
+      powerAnalyzeVcd(""), disableAnnotationsUnknown(false),
       disableAnnotationsClassless(false), lowerAnnotationsNoRefTypePorts(false),
       allowAddingPortsOnPublic(false), probesToSignals(false),
       preserveAggregate(firrtl::PreserveAggregate::None),
@@ -802,7 +830,10 @@ circt::firtool::FirtoolOptions::FirtoolOptions()
       lintXmrsInDesign(true), emitAllBindFiles(false) {
   if (!clOptions.isConstructed())
     return;
-  outputFilename = clOptions->outputFilename;
+  outputFilename = clOptions->outputFilename;  
+  nameUnnamedSignals = clOptions->nameUnnamedSignals;
+  runPowerAnalysis = clOptions->runPowerAnalysis;
+  powerAnalyzeVcd = clOptions->powerAnalyzeVcd;
   disableAnnotationsUnknown = clOptions->disableAnnotationsUnknown;
   disableAnnotationsClassless = clOptions->disableAnnotationsClassless;
   lowerAnnotationsNoRefTypePorts = clOptions->lowerAnnotationsNoRefTypePorts;

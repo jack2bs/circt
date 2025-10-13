@@ -905,4 +905,24 @@ def CheckLayers : Pass<"firrtl-check-layers", "firrtl::CircuitOp"> {
   }];
 }
 
+def PowerAnalyze : Pass<"firrtl-power-analyze", "firrtl::CircuitOp"> {
+  let summary = "Print the names of all FIRRTL modules";
+  let description = [{
+    This pass walks all FIRRTL modules in the circuit and prints their names.
+    Intended as a skeleton for future power analysis passes.
+  }];
+  let options = [
+    Option<"powerAnalyzeVcd", "power-analyze-vcd", "std::string", "", "VCD file for switching activity">,
+  ];
+
+}
+
+def NameUnnamedSignals : Pass<"firrtl-name-unnamed-signals", "firrtl::CircuitOp"> {
+  let summary = "Print the names of all FIRRTL modules";
+  let description = [{
+    This pass walks all FIRRTL modules in the circuit and gives
+    unnamed signals names and wires.
+  }];
+}
+
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD

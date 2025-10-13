@@ -20,3 +20,5 @@ lit.site.cfg.py
 
 # External software
 /ext
+
+.clangd

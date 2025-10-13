@@ -30,6 +30,7 @@ namespace firtool {
 /// Set of options used to control the behavior of the firtool pipeline.
 class FirtoolOptions {
 public:
+
   FirtoolOptions();
 
   // Helper Types
@@ -80,6 +81,15 @@ public:
   }
 
   bool isDefaultOutputFilename() const { return outputFilename == "-"; }
+
+  bool shouldNameUnnamedSignals() const { 
+    return nameUnnamedSignals; 
+  }
+  bool shouldRunPowerAnalysis() const { 
+    return runPowerAnalysis;
+  }
+  const std::string &getPowerAnalyzeVcd() const { return powerAnalyzeVcd; }
+
   bool shouldDisableUnknownAnnotations() const {
     return disableAnnotationsUnknown;
   }
@@ -148,6 +158,20 @@ public:
     outputFilename = name;
     return *this;
   }
+
+  FirtoolOptions &setNameUnnamedSignals(bool value) {
+    nameUnnamedSignals = value;
+    return *this;
+  }
+  FirtoolOptions &setRunPowerAnalysis(bool value) {
+    runPowerAnalysis = value;
+    return *this;
+  }
+  FirtoolOptions &setPowerAnalyzeVcd(const std::string &vcd) {
+    powerAnalyzeVcd = vcd;
+    return *this;
+  }
+
 
   FirtoolOptions &setDisableUnknownAnnotations(bool disable) {
     disableAnnotationsUnknown = disable;
@@ -389,6 +413,10 @@ public:
 
 private:
   std::string outputFilename;
+
+  bool nameUnnamedSignals;
+  bool runPowerAnalysis;
+  std::string powerAnalyzeVcd;
 
   // LowerFIRRTLAnnotations
   bool disableAnnotationsUnknown;
