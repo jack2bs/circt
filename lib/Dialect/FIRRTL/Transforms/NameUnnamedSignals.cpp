@@ -14,7 +14,9 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "mlir/IR/Location.h"
 #include "mlir/Pass/Pass.h"
+#include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 
 namespace circt {
@@ -38,8 +40,14 @@ struct NameUnnamedSignalsPass
 /// The main logic for the NameUnnamedSignals pass.
 void NameUnnamedSignalsPass::runOnOperation() {
   auto circuitOp = getOperation();
+  circuitOp->dumpPretty();
+  llvm::errs() << "\n\n\n\n";
 
   int i = 0;
+
+  circuitOp->walk([&](FNamableOp op) {
+    llvm::errs() << "[NameUnnamedSignals] Found namable operation: " << op.getName() << "\n";
+  });
 
   // Traverse all modules in the circuit.
   for (auto module : circuitOp.getOps<FModuleOp>()) {
@@ -49,10 +57,18 @@ void NameUnnamedSignalsPass::runOnOperation() {
     module.walk([&](Operation *op) {
       // Check if the operation has a result without a name.
 
-      // op->dumpPretty();
+      op->dumpPretty();
+      // Instance ops results are inputs and outputs which maintain their names
+      if (!isExpression(op))
+      {
+        return;
+      }
 
       for (OpResult result : op->getResults()) {
-        if (!result.hasOneUse() || !llvm::dyn_cast<firrtl::FIRRTLType>(result.getType()))
+        // if (!result.hasOneUse() || !llvm::dyn_cast<firrtl::FIRRTLType>(result.getType()))
+        //   continue;
+
+        if (auto maybeNameLoc = result.getLoc()->findInstanceOf<mlir::NameLoc>())
           continue;
 
         // Generate a unique name for the wire.
@@ -62,15 +78,23 @@ void NameUnnamedSignalsPass::runOnOperation() {
         builder.setInsertionPointAfter(op);
         auto wire = builder.create<WireOp>(op->getLoc(), llvm::dyn_cast<firrtl::FIRRTLType>(result.getType()),
                                            builder.getStringAttr(wireName));
-
         AnnotationSet::addDontTouch(wire);
 
         // Replace all uses of the unnamed signal with the new wire.
+        
+        // THIS IS THE LINE THAT CAUSES PROBLEMS
         result.replaceAllUsesWith(wire->getResult(0));
 
+
         builder.create<MatchingConnectOp>(op->getLoc(), wire->getResult(0), result);
+
 
       }
     });
   }
+  
+  // llvm::errs() << "[NameUnnamedSignals] Added wire: " << wireName << "\n";
+  circuitOp->dumpPretty();
+  llvm::errs() << "[NameUnnamedSignals] Finished processing circuit.\n";
+
 }

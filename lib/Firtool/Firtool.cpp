@@ -10,6 +10,7 @@
 #include "circt/Conversion/Passes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/SV/SVPasses.h"
@@ -92,10 +93,6 @@ LogicalResult firtool::populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
 
   // Width inference creates canonicalization opportunities.
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createInferWidths());
-
-  if (opt.shouldNameUnnamedSignals()) {
-    pm.nest<firrtl::CircuitOp>().addPass(firrtl::createNameUnnamedSignals());
-  }
 
   pm.nest<firrtl::CircuitOp>().addPass(firrtl::createMemToRegOfVec(
       {/*replSeqMem=*/opt.shouldReplaceSequentialMemories(),
@@ -303,6 +300,10 @@ LogicalResult firtool::populateLowFIRRTLToHW(mlir::PassManager &pm,
 
   // Run the verif op verification pass
   pm.addNestedPass<hw::HWModuleOp>(verif::createVerifyClockedAssertLikePass());
+
+  if (opt.shouldNameUnnamedSignals()) {
+    pm.nest<hw::HWModuleOp>().addPass(hw::createHWNameUnnamedSignals());
+  }
 
   if (opt.shouldRunPowerAnalysis()) {
     pm.nest<firrtl::CircuitOp>().addPass(firrtl::createPowerAnalyze({opt.getPowerAnalyzeVcd()}));

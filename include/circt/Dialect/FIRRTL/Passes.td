@@ -918,7 +918,7 @@ def PowerAnalyze : Pass<"firrtl-power-analyze", "firrtl::CircuitOp"> {
 }
 
 def NameUnnamedSignals : Pass<"firrtl-name-unnamed-signals", "firrtl::CircuitOp"> {
-  let summary = "Print the names of all FIRRTL modules";
+  let summary = "Assign a name to any unnamed signals for analysis";
   let description = [{
     This pass walks all FIRRTL modules in the circuit and gives
     unnamed signals names and wires.

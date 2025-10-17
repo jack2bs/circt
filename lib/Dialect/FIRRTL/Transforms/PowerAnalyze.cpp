@@ -18,6 +18,7 @@
 #include "llvm/TableGen/TableGenBackend.h"
 #include <fstream>
 #include <ostream>
+#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 
 namespace circt {
 namespace firrtl {
@@ -252,10 +253,24 @@ void PowerAnalyzePass::walkOps()
     CircuitOp circuitOp = getOperation();
     llvm::errs() << "[PowerAnalyze] Analyzing circuit: " << circuitOp.getOperationName() << "\n";
 
+
     // Print the operation name for each operation in the circuit
+
+    // Assume the whole circuit is a directed acyclic graph (DAG).
+    // We want to turn each module's paths from input to output into operations, recursively, until we reach the top module
+    // For each module, we need to:
+    // (1) run DFS to annotate all nodes with the outputs they feed and to construct a topological ordering
+    // (2) run DFS a second time to annotate all nodes with the inputs they depend on
+    // (3) Go through all nodes in topological order, assigning a fast and slow hw block to each op, and calculating slow and fast path lengths from roots to leaves.
+
+
     circuitOp->walk([&](Operation *op) {
         llvm::errs() << "[PowerAnalyze] Found operation: " << op->getName() << "\n";
-    });
+    
+        op->getParentOp();
+      });
+
+    
 
     // circuitOp->walk(FnT &&callback);
 }
@@ -264,6 +279,8 @@ void PowerAnalyzePass::walkOps()
 void PowerAnalyzePass::runOnOperation() 
 {
 
+
+
     // Print the VCD file option if provided
     if (!powerAnalyzeVcd.empty()) {
         llvm::errs() << "[PowerAnalyze] Using VCD file for switching activity: "
@@ -271,6 +288,15 @@ void PowerAnalyzePass::runOnOperation()
     }
     // circuitOp->dumpPretty();
     llvm::errs() << "[PowerAnalyze] FIRRTL Modules found:\n";
+
+    auto &instanceGraph = getAnalysis<InstanceGraph>();
+    instanceGraph.walkPostOrder([&](auto &node) {
+      if (FModuleLike mod = dyn_cast<FModuleLike>(*node.getModule()))
+      {
+        llvm::errs() << "[PowerAnalyze] Found module: " << mod.getModuleName() << "\n";
+      }
+    });
+    return;
 
     // llvm::errs() << "###" << i++ << ": " << module.getName() << "\n";
     // for (auto name : module.getPorts()) {
@@ -302,6 +328,9 @@ void PowerAnalyzePass::runOnOperation()
         parseVCD();
     }
     calcSwitchingActivity();
+
+
+
     walkOps();
 
     markAllAnalysesPreserved();

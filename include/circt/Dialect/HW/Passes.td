@@ -92,4 +92,22 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
+def HWPowerAnalyze : Pass<"hw-power-analyze", "hw::HWModuleOp"> {
+  let summary = "Estimate the power of a HW circuit";
+  let description = [{
+    This pass estimates the power and area for a hw circuit.
+  }];
+  let options = [
+    Option<"powerAnalyzeVcd", "power-analyze-vcd", "std::string", "", "VCD file for switching activity">,
+  ];
+}
+
+def HWNameUnnamedSignals : Pass<"hw-name-unnamed-signals", "hw::HWModuleOp"> {
+  let summary = "Assign a name to any unnamed signals for analysis";
+  let description = [{
+    This pass walks all FIRRTL modules in the circuit and gives
+    unnamed signals names and wires.
+  }];
+}
+
 #endif // CIRCT_DIALECT_HW_PASSES_TD
