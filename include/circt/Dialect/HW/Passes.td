@@ -92,7 +92,7 @@ def HWAggregateToComb : Pass<"hw-aggregate-to-comb", "hw::HWModuleOp"> {
   let dependentDialects = ["comb::CombDialect"];
 }
 
-def HWPowerAnalyze : Pass<"hw-power-analyze", "hw::HWModuleOp"> {
+def HWPowerAnalyze : Pass<"hw-power-analyze", "mlir::ModuleOp"> {
   let summary = "Estimate the power of a HW circuit";
   let description = [{
     This pass estimates the power and area for a hw circuit.

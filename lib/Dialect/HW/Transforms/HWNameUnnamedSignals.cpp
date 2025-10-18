@@ -40,6 +40,8 @@ struct HWNameUnnamedSignalsPass
 /// The main logic for the NameUnnamedSignals pass.
 void HWNameUnnamedSignalsPass::runOnOperation() {
 
+  llvm::errs() << "[HWNameUnnamedSignals] Running pass to name unnamed signals\n";
+
   auto module = getOperation();
 
   int i = 0;
