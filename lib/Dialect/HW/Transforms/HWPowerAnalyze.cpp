@@ -19,6 +19,7 @@
 #include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/CodeGen/StackMaps.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TableGen/TableGenBackend.h"
@@ -83,29 +84,39 @@ struct Delay
     int slow = 0;
     int fast = 0;
 };
-using DelayToNodes = std::unordered_multimap<HWPathNodePtr, Delay>;
+struct DelayPath
+{
+    HWPathNodePtr node;
+    Delay delay;
+    int fromInd;
+    int toInd;
+};
+
+using DelaysFromRoot = std::vector<DelayPath>;
+using DelaysToLeaf = std::vector<DelayPath>;
 struct HWNodeDelays {
     HWPathNodePtr node;
 
-    // Value is delay
+    llvm::SmallVector<int> forwardIndices;
+    llvm::SmallVector<int> backwardIndices;
 
-    DelayToNodes delaysIn;  // Delay from roots
-    DelayToNodes delaysOut; // Delay to leaves
+    DelaysFromRoot delaysIn;  // Delay from roots
+    DelaysToLeaf delaysOut; // Delay to leaves
 };
 using HWNodeDelaysPtr = std::shared_ptr<HWNodeDelays>;
 
 struct HWModulePPAModel {
 
-    HWNodeDelaysPtr dfsPathForward(Value & next, int nextInd, HWNodeDelaysPtr & parent, int parInd);
-    HWNodeDelaysPtr dfsPathBackward(Value & next, int nextInd, HWNodeDelaysPtr & child, int chiInd);
+    HWNodeDelaysPtr dfsPathForward(Operation * next, int nextInd, HWNodeDelaysPtr & parent, int parInd);
+    HWNodeDelaysPtr dfsPathBackward(Operation * next, int nextInd, HWNodeDelaysPtr & child, int chiInd);
     // HWModulePPAModel(Operation *moduleOp, mlir::AnalysisManager &am);
     HWModulePPAModel(Operation *moduleOp);
     static HWModulePPAModel & getModel(Operation * moduleOp);
 
     static HWPPAInfo getPPAInfo(Operation * op);
 
-    std::optional<Delay> getMaxDelayRoot2Leaf(Value & root, Value & leaf);
-    std::optional<Delay> getMaxDelayLeafFromRoot(Value & root, Value & leaf);
+    // std::optional<Delay> getMaxDelayRoot2Leaf(Value & root, Value & leaf);
+    // std::optional<Delay> getMaxDelayLeafFromRoot(Value & root, Value & leaf);
 
     HWModulePPAModel & getModulesAnalysis(InstanceOp & op);
 
@@ -114,11 +125,15 @@ private:
 
     void traverseFromLeaf(Value & leaf, int ind);
     void traverseFromRoot(Value & root, int ind);
+    // void traverseFromRoot(Operation * root);
 
-    std::unordered_map<llvm::hash_code, HWNodeDelaysPtr> rootBlocks;
-    std::unordered_map<llvm::hash_code, HWNodeDelaysPtr> leafBlocks;
-    std::unordered_map<llvm::hash_code, HWNodeDelaysPtr> blocks;
-    std::unordered_map<Operation *, llvm::SmallVector<HWNodeDelaysPtr>> allOps;
+    std::unordered_map<llvm::hash_code, DelaysToLeaf> rootBlocks;
+    std::unordered_map<llvm::hash_code, DelaysFromRoot> leafBlocks;
+    // std::unordered_map<llvm::hash_code, HWNodeDelaysPtr> blocks;
+    std::unordered_map<Operation *, HWNodeDelaysPtr> blocks;
+    std::unordered_set<Operation *> forwardVisited;
+    std::unordered_set<Operation *> backwardVisited;
+    // std::unordered_map<Operation *, llvm::SmallVector<HWNodeDelaysPtr>> allOps;
 
     std::map<StringRef, HWModuleOp> siblings;
 
@@ -132,6 +147,7 @@ private:
     bool processedSiblings = false;
 
     HWModuleOp analyzedOp;
+    OutputOp analyzedOutputOp;
     // mlir::AnalysisManager am;
 
     int foundLeaves = 0;
@@ -223,6 +239,17 @@ HWPPAInfo HWModulePPAModel::getPPAInfo(Operation * op)
             0
         };
     }
+    if (llvm::dyn_cast<HWModuleOp>(op) || llvm::dyn_cast<OutputOp>(op)) {
+        return
+        {
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+        };
+    }
     return 
     {
         1,
@@ -234,54 +261,54 @@ HWPPAInfo HWModulePPAModel::getPPAInfo(Operation * op)
     };
 }
 
-std::optional<Delay> HWModulePPAModel::getMaxDelayRoot2Leaf(Value & root, Value & leaf)
-{
+// std::optional<Delay> HWModulePPAModel::getMaxDelayRoot2Leaf(Value & root, Value & leaf)
+// {
 
-    HWNodeDelaysPtr & rootBlk = rootBlocks.at(hash_value(root));
-    HWPathNodePtr & leafBlk = leafBlocks.at(hash_value(leaf))->node;
+//     DelaysToLeaf & rootBlk = rootBlocks.at(hash_value(root));
+//     // HWPathNodePtr & leafBlk = leafBlocks.at(hash_value(leaf))->node;
 
-    bool found = false;
-    Delay maxDelay{0,0};
-    for (auto & doIt : rootBlk->delaysOut) {
-        HWPathNodePtr destNode = doIt.first;
-        Delay d = doIt.second;
-        if (destNode == leafBlk) {
-            found = true;
-            if (d.slow > maxDelay.slow)
-                maxDelay.slow = d.slow;
-            if (d.fast > maxDelay.fast)
-                maxDelay.fast = d.fast;
-        }
-    }
+//     bool found = false;
+//     Delay maxDelay{0,0};
+//     for (auto & doIt : rootBlk) {
+//         Value destNode = std::get<0>(doIt);
+//         Delay d = std::get<1>(doIt);
+//         if (destNode == leaf) {
+//             found = true;
+//             if (d.slow > maxDelay.slow)
+//                 maxDelay.slow = d.slow;
+//             if (d.fast > maxDelay.fast)
+//                 maxDelay.fast = d.fast;
+//         }
+//     }
 
-    if (found)
-        return maxDelay;
-    return std::nullopt;
-}
+//     if (found)
+//         return maxDelay;
+//     return std::nullopt;
+// }
 
-std::optional<Delay> HWModulePPAModel::getMaxDelayLeafFromRoot(Value & root, Value & leaf)
-{
-    HWNodeDelaysPtr & leafBlk = leafBlocks.at(hash_value(leaf));
-    HWPathNodePtr & rootBlk = rootBlocks.at(hash_value(root))->node;
+// std::optional<Delay> HWModulePPAModel::getMaxDelayLeafFromRoot(Value & root, Value & leaf)
+// {
+//     DelaysFromRoot & leafBlk = leafBlocks.at(hash_value(leaf));
+//     // HWPathNodePtr & rootBlk = rootBlocks.at(hash_value(root))->node;
 
-    bool found = false;
-    Delay maxDelay{0,0};
-    for (auto & diIt : leafBlk->delaysIn) {
-        HWPathNodePtr srcNode = diIt.first;
-        Delay d = diIt.second;
-        if (srcNode == rootBlk) {
-            found = true;
-            if (d.slow > maxDelay.slow)
-                maxDelay.slow = d.slow;
-            if (d.fast > maxDelay.fast)
-                maxDelay.fast = d.fast;
-        }
-    }
+//     bool found = false;
+//     Delay maxDelay{0,0};
+//     for (auto & diIt : leafBlk) {
+//         Value srcNode = diIt.node. std::get<0>(diIt);
+//         Delay d = std::get<1>(diIt);
+//         if (srcNode == root) {
+//             found = true;
+//             if (d.slow > maxDelay.slow)
+//                 maxDelay.slow = d.slow;
+//             if (d.fast > maxDelay.fast)
+//                 maxDelay.fast = d.fast;
+//         }
+//     }
 
-    if (found)
-        return maxDelay;
-    return std::nullopt;
-}
+//     if (found)
+//         return maxDelay;
+//     return std::nullopt;
+// }
 
 HWModulePPAModel & HWModulePPAModel::getModulesAnalysis(InstanceOp & op)
 {
@@ -306,330 +333,325 @@ HWModulePPAModel & HWModulePPAModel::getModulesAnalysis(InstanceOp & op)
     return model->second;
 }
 
-
-HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Value & next, int nextInd, HWNodeDelaysPtr & child, int chiInd)
+HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Operation * next, int nextInd, HWNodeDelaysPtr & child, int chiInd)
 {
     // We traverse forward first, so all nodes should already be in blocks
-    Value & curVal = next;
-    int curInd = nextInd;
-    Operation * defOp = curVal.getDefiningOp();
-    if (isa<BlockArgument>(curVal)) {
-        defOp = analyzedOp.getOperation();
+    Operation * curOp = next;
+    if (!curOp)
+    {
+        curOp = analyzedOp.getOperation();
     }
-    auto blk = blocks.find(hash_value(curVal));
-    
+    int curInd = nextInd;
+
+    auto blk = blocks.find(curOp);
+
     if (blk == blocks.end())
     {
         HWPathNodePtr pn = std::make_shared<HWPathNode>();
-        pn->op = defOp;
-        pn->val = curVal;
+        pn->op = curOp;
         pn->isTrueRoot = false;
         pn->isTrueLeaf = false;
-        pn->ppaInfo = getPPAInfo(defOp);
+        pn->ppaInfo = getPPAInfo(curOp);
 
         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
         newBlock->node = pn;
+        newBlock->forwardIndices = llvm::SmallVector<int>{};
+        newBlock->backwardIndices = llvm::SmallVector<int>{};
 
-        blk = blocks.insert({hash_value(curVal), newBlock}).first;
+        blk = blocks.insert({curOp, newBlock}).first;
     }
     HWNodeDelaysPtr & cur = blk->second;
 
-    if (allOps.find(defOp) == allOps.end())
-    {
-        allOps.insert({defOp, llvm::SmallVector<HWNodeDelaysPtr>()});
-    }
-    allOps.at(defOp).push_back(cur);
 
-    // If we haven't traversed this node before, traverse it
-    if (!cur->delaysIn.size()) {
-
-        // Check if this is a root node that we are dealing with
-        if (dyn_cast<HWModuleOp>(defOp) || dyn_cast<seq::Clocked>(defOp) || dyn_cast<ConstantOp>(defOp)) {
-            HWPathNodePtr pn = blk->second->node;
-            cur->delaysIn.emplace(pn, Delay{pn->ppaInfo.slowDelay,pn->ppaInfo.fastDelay});
-            pn->isTrueRoot = (dyn_cast<seq::Clocked>(defOp) || dyn_cast<ConstantOp>(defOp));
-        }
-        else if (InstanceOp instOp = dyn_cast<InstanceOp>(defOp))
+    if ((child != nullptr) && (isa<HWModuleOp>(curOp) || isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp))) {
+        HWPathNodePtr pn = cur->node;
+        // HWPPAInfo outpPPA = getPPAInfo(curOp);
+        if (!cur->delaysIn.size())
         {
+            cur->delaysIn.push_back(DelayPath{pn, Delay{0,0}, -1, -1});
+        }
+        // child->delaysIn.push_back(DelayPath{pn, Delay{pn->ppaInfo.slowDelay, pn->ppaInfo.fastDelay}, curInd, chiInd});
+        pn->isTrueRoot |= (isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp));
+        return cur;
+    }
+
+    if (cur->backwardIndices.size() >= curOp->getNumOperands()) 
+    {
+        return cur;
+    }
+    for (uint i = 0; i < curOp->getNumOperands(); i++)
+    {
+        if (std::find(cur->backwardIndices.begin(), cur->backwardIndices.end(), i) != cur->backwardIndices.end())
+        {
+            continue;
+        }
+        cur->backwardIndices.push_back(i);
+
+        Value operand = curOp->getOperand(i);
+        Operation * defOp = operand.getDefiningOp();
+        OpResult res = dyn_cast<OpResult>(operand);
+
+        HWNodeDelaysPtr par = dfsPathBackward(defOp, i, cur, curInd);
+
+        if (defOp && isa<InstanceOp>(defOp))
+        {
+            InstanceOp instOp = dyn_cast<InstanceOp>(defOp);
             HWModulePPAModel & model = getModulesAnalysis(instOp);
-            Value & output = model.outpsList.at(curInd);
-            HWNodeDelaysPtr paths = model.leafBlocks.find(hash_value(output))->second;
-            for (auto & pi : paths->delaysIn) {
-                if (!pi.first->isTrueRoot)
+            HWNodeDelaysPtr & outp = model.blocks.at(model.analyzedOutputOp.getOperation());
+
+            for (auto & pathInternal : outp->delaysIn)
+            {
+                if (pathInternal.toInd != res.getResultNumber())
                 {
                     continue;
                 }
-                Delay piD = pi.second;
-                HWPathNodePtr pn = cur->node;
-                pn->isTrueRoot = true;
-                cur->delaysIn.emplace(pn, Delay{piD.slow, piD.fast});
-            }
+                if (pathInternal.node->isTrueRoot)
+                {
+                    Delay pathInternalD = pathInternal.delay;
 
-            for (uint i = 0; i < defOp->getNumOperands(); i++)
-            {
-
-                auto cp = model.getMaxDelayLeafFromRoot(model.inpsList.at(i), output);
-                if (!cp.has_value()) {
-                    // No path between root and leaf in the instance
+                    cur->delaysIn.push_back(DelayPath{cur->node, Delay{pathInternalD.slow, pathInternalD.fast}, pathInternal.toInd, curInd});
                     continue;
                 }
-                Value operand = defOp->getOperand(i);
-                HWNodeDelaysPtr par = dfsPathBackward(operand, i,  cur, curInd);
-                for (auto & pi : par->delaysIn)
+                for (auto & po : par->delaysIn)
                 {
-                    int curSlow = cp->slow;
-                    int curFast = cp->fast;
-                    Delay piD = pi.second;
-                    cur->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
-                }
-            }
-        }
-        else // Otherwise, continue traversing
-        {
-            for (uint i = 0; i < defOp->getNumOperands(); i++)
-            {
-                Value operand = defOp->getOperand(i);
-                HWNodeDelaysPtr par = dfsPathBackward(operand, i, cur, curInd);
-                for (auto & pi : par->delaysIn)
-                {
-                    int curSlow = cur->node->ppaInfo.slowDelay;
-                    int curFast = cur->node->ppaInfo.fastDelay;
-                    Delay piD = pi.second;
-                    cur->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
-                }
-            }
-        }
-    }
-
-    // if (child == nullptr)
-    //     return cur;
-
-    // // Give delayIn info to the current node's parent
-    // int curSlow = cur->node->ppaInfo.slowDelay;
-    // int curFast = cur->node->ppaInfo.fastDelay;
-    // for (auto & pi : cur->delaysIn)
-    // {
-    //     Delay piD = pi.second;
-    //     child->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
-    // }
-    return cur;
-}
-
-
-HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Value & next, int nextInd, HWNodeDelaysPtr & parent, int parInd)
-{
-    // Rename
-    Value & curVal = next;
-    int curInd = nextInd;
-    Operation * defOp = curVal.getDefiningOp();
-    if (isa<BlockArgument>(curVal)) {
-        defOp = analyzedOp.getOperation();
-    }
-
-    auto blk = blocks.find(hash_value(curVal));
-
-    // If we haven't traversed this node before, construct a block add it to blocks
-    if (blk == blocks.end())
-    {
-        HWPathNodePtr pn = std::make_shared<HWPathNode>();
-        pn->op = defOp;
-        pn->val = curVal;
-        pn->isTrueRoot = false;
-        pn->isTrueLeaf = false;
-        pn->ppaInfo = getPPAInfo(defOp);
-
-        HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
-        newBlock->node = pn;
-
-        blk = blocks.insert({hash_value(curVal), newBlock}).first;
-    }
-    HWNodeDelaysPtr & cur = blk->second;
-
-    if (allOps.find(defOp) == allOps.end())
-    {
-        allOps.insert({defOp, llvm::SmallVector<HWNodeDelaysPtr>()});
-    }
-    allOps.at(defOp).push_back(cur);
-
-    if (!cur->delaysOut.size())
-    {
-        // Now traverse the new block (the current block)
-        for (auto & use : curVal.getUses()) {
-
-            Operation * owner = use.getOwner();
-            
-            if (InstanceOp instOp = dyn_cast<InstanceOp>(owner))
-            {
-                HWModulePPAModel & model = getModulesAnalysis(instOp);
-                
-                Value & input = model.inpsList.at(use.getOperandNumber());
-                HWNodeDelaysPtr paths = model.rootBlocks.find(hash_value(input))->second;
-                for (auto & po : paths->delaysOut) {
-                    if (!po.first->isTrueLeaf)
+                    if ((pathInternal.fromInd != po.toInd))
                     {
                         continue;
                     }
-                    Delay poD = po.second;
-                    HWPathNodePtr pn = cur->node;
-                    pn->isTrueLeaf = true;
-                    cur->delaysOut.emplace(pn, Delay{poD.slow, poD.fast});
+                    Delay pathInternalD = pathInternal.delay;
+                    Delay poD = po.delay;
+
+                    cur->delaysIn.push_back(DelayPath{po.node, Delay{pathInternalD.slow + poD.slow, pathInternalD.fast + poD.fast}, po.fromInd, curInd});
                 }
 
-                for (uint i = 0; i < owner->getNumResults(); i++)
-                {
-
-                    auto cp = model.getMaxDelayRoot2Leaf(input, model.outpsList.at(i));
-                    if (!cp.has_value()) {
-                        // No path between root and leaf in the instance
-                        continue;
-                    }
-                    OpResult res = owner->getResult(i);
-                    dfsPathForward(res, i, cur, curInd);
-                }
             }
 
-            // Check if this use of cur is a leaf node (output or clocked op)
-            else if (isa<OutputOp>(owner) || isa<seq::Clocked>(owner)) {
-                HWPathNodePtr pn = blk->second->node;
-                HWPPAInfo outpPPA = getPPAInfo(owner);
-                cur->delaysOut.emplace(pn, Delay{outpPPA.slowDelay,outpPPA.fastDelay});
-                pn->isTrueLeaf = dyn_cast<seq::Clocked>(owner);
-                foundLeaves++;
-
-                if (allOps.find(owner) == allOps.end())
-                {
-                    allOps.insert({owner, llvm::SmallVector<HWNodeDelaysPtr>()});
-                }
-
-            } else
-            { // Otherwise, continue traversing
-                for (uint i = 0; i < owner->getNumResults(); i++)
-                {
-
-                    OpResult res = owner->getResult(i);
-                    dfsPathForward(res, i, cur, curInd);
-                }
-            }
+            continue;
+        }
+        if (defOp && (isa<HWModuleOp>(defOp) || isa<seq::Clocked>(defOp) || isa<ConstantOp>(defOp)))
+        {
+            int curSlow = par->node->ppaInfo.slowDelay;
+            int curFast = par->node->ppaInfo.fastDelay;
+            cur->delaysIn.push_back(DelayPath{par->node, Delay{curSlow, curFast}, static_cast<int>(res.getResultNumber()), curInd});
+            
+            continue;
+        }
+        for (auto & pi : par->delaysIn)
+        {
+            int curSlow = par->node->ppaInfo.slowDelay;
+            int curFast = par->node->ppaInfo.fastDelay;
+            Delay piD = pi.delay;
+            cur->delaysIn.push_back(DelayPath{pi.node, Delay{piD.slow + curSlow, piD.fast + curFast }, pi.fromInd, curInd});
         }
     }
-
-    if (parent == nullptr)
-        return cur;
-
-    // Give delayOut info to the parent about current's children
-
-    // IF cur->node->op is an instance, we need to adjust the delays here.
-    // IF THERE IS NO PATH BETWEEN A ROOT AND LEAF WE SHOULD NOT INCLUDE IT IN THE PATHS
-    int curSlow;
-    int curFast;
-    if (InstanceOp instOp = dyn_cast<InstanceOp>(cur->node->op))
-    {
-        HWModulePPAModel & model = getModulesAnalysis(instOp);
-
-        auto cp = model.getMaxDelayRoot2Leaf(model.inpsList.at(parInd), model.outpsList.at(nextInd));
-        // model.dfsPathForward(Value &next, HWNodeDelaysPtr &parent)
-
-        if (!cp.has_value()) {
-            // No path between root and leaf in the instance
-            return cur; 
-        }
-
-        curSlow = cp->slow; // CUR SLOW IS THE PATH FROM THE INPUT (PARENT) TO THE OUTPUT (CURRENT)
-        curFast = cp->fast; // CUR FAST IS THE PATH FROM THE INPUT (PARENT) TO THE OUTPUT (CURRENT)
-    } else
-    {
-        curSlow = cur->node->ppaInfo.slowDelay;
-        curFast = cur->node->ppaInfo.fastDelay;
-    }
-
-    for (auto & po : cur->delaysOut) {
-        Delay poD = po.second;
-        parent->delaysOut.emplace(po.first, Delay{poD.slow + curSlow, poD.fast + curFast });
-    }
-
-    return cur;
 }
 
-// HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, HWNodeDelaysPtr & parent, int parInd)
+// HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Value & next, int nextInd, HWNodeDelaysPtr & child, int chiInd)
+// {
+//     // We traverse forward first, so all nodes should already be in blocks
+//     Value & curVal = next;
+//     int curInd = nextInd;
+//     Operation * defOp = curVal.getDefiningOp();
+//     if (isa<BlockArgument>(curVal)) {
+//         defOp = analyzedOp.getOperation();
+//     }
+//     auto blk = blocks.find(hash_value(curVal));
+    
+//     if (blk == blocks.end())
+//     {
+//         HWPathNodePtr pn = std::make_shared<HWPathNode>();
+//         pn->op = defOp;
+//         pn->val = curVal;
+//         pn->isTrueRoot = false;
+//         pn->isTrueLeaf = false;
+//         pn->ppaInfo = getPPAInfo(defOp);
+
+//         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
+//         newBlock->node = pn;
+
+//         blk = blocks.insert({hash_value(curVal), newBlock}).first;
+//     }
+//     HWNodeDelaysPtr & cur = blk->second;
+
+//     if (allOps.find(defOp) == allOps.end())
+//     {
+//         allOps.insert({defOp, llvm::SmallVector<HWNodeDelaysPtr>()});
+//     }
+//     allOps.at(defOp).push_back(cur);
+
+//     // If we haven't traversed this node before, traverse it
+//     if (!cur->delaysIn.size()) {
+
+//         // Check if this is a root node that we are dealing with
+//         if (dyn_cast<HWModuleOp>(defOp) || dyn_cast<seq::Clocked>(defOp) || dyn_cast<ConstantOp>(defOp)) {
+//             HWPathNodePtr pn = blk->second->node;
+//             cur->delaysIn.emplace(pn, Delay{pn->ppaInfo.slowDelay,pn->ppaInfo.fastDelay});
+//             pn->isTrueRoot = (dyn_cast<seq::Clocked>(defOp) || dyn_cast<ConstantOp>(defOp));
+//         }
+//         else if (InstanceOp instOp = dyn_cast<InstanceOp>(defOp))
+//         {
+//             HWModulePPAModel & model = getModulesAnalysis(instOp);
+//             Value & output = model.outpsList.at(curInd);
+//             HWNodeDelaysPtr paths = model.leafBlocks.find(hash_value(output))->second;
+//             for (auto & pi : paths->delaysIn) {
+//                 if (!pi.first->isTrueRoot)
+//                 {
+//                     continue;
+//                 }
+//                 Delay piD = pi.second;
+//                 HWPathNodePtr pn = cur->node;
+//                 pn->isTrueRoot = true;
+//                 cur->delaysIn.emplace(pn, Delay{piD.slow, piD.fast});
+//             }
+
+//             for (uint i = 0; i < defOp->getNumOperands(); i++)
+//             {
+
+//                 auto cp = model.getMaxDelayLeafFromRoot(model.inpsList.at(i), output);
+//                 if (!cp.has_value()) {
+//                     // No path between root and leaf in the instance
+//                     continue;
+//                 }
+//                 Value operand = defOp->getOperand(i);
+//                 HWNodeDelaysPtr par = dfsPathBackward(operand, i,  cur, curInd);
+//                 for (auto & pi : par->delaysIn)
+//                 {
+//                     int curSlow = cp->slow;
+//                     int curFast = cp->fast;
+//                     Delay piD = pi.second;
+//                     cur->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
+//                 }
+//             }
+//         }
+//         else // Otherwise, continue traversing
+//         {
+//             for (uint i = 0; i < defOp->getNumOperands(); i++)
+//             {
+//                 Value operand = defOp->getOperand(i);
+//                 HWNodeDelaysPtr par = dfsPathBackward(operand, i, cur, curInd);
+//                 for (auto & pi : par->delaysIn)
+//                 {
+//                     int curSlow = cur->node->ppaInfo.slowDelay;
+//                     int curFast = cur->node->ppaInfo.fastDelay;
+//                     Delay piD = pi.second;
+//                     cur->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
+//                 }
+//             }
+//         }
+//     }
+
+//     // if (child == nullptr)
+//     //     return cur;
+
+//     // // Give delayIn info to the current node's parent
+//     // int curSlow = cur->node->ppaInfo.slowDelay;
+//     // int curFast = cur->node->ppaInfo.fastDelay;
+//     // for (auto & pi : cur->delaysIn)
+//     // {
+//     //     Delay piD = pi.second;
+//     //     child->delaysIn.emplace(pi.first, Delay{piD.slow + curSlow, piD.fast + curFast });
+//     // }
+//     return cur;
+// }
+
+
+// HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Value & next, int nextInd, HWNodeDelaysPtr & parent, int parInd)
 // {
 //     // Rename
-
-//     Operation * curOp = next;
+//     Value & curVal = next;
 //     int curInd = nextInd;
+//     Operation * defOp = curVal.getDefiningOp();
+//     if (isa<BlockArgument>(curVal)) {
+//         defOp = analyzedOp.getOperation();
+//     }
 
-//     auto blk = blocks.find(curOp);
+//     auto blk = blocks.find(hash_value(curVal));
 
 //     // If we haven't traversed this node before, construct a block add it to blocks
 //     if (blk == blocks.end())
 //     {
 //         HWPathNodePtr pn = std::make_shared<HWPathNode>();
-//         pn->op = curOp;
+//         pn->op = defOp;
+//         pn->val = curVal;
 //         pn->isTrueRoot = false;
 //         pn->isTrueLeaf = false;
-//         pn->ppaInfo = getPPAInfo(curOp);
+//         pn->ppaInfo = getPPAInfo(defOp);
 
 //         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
 //         newBlock->node = pn;
 
-//         blk = blocks.insert({curOp, newBlock}).first;
+//         blk = blocks.insert({hash_value(curVal), newBlock}).first;
 //     }
 //     HWNodeDelaysPtr & cur = blk->second;
 
-//     if (isa<OutputOp>(curOp) || isa<seq::Clocked>(curOp)) {
-//         HWPathNodePtr pn = blk->second->node;
-//         HWPPAInfo outpPPA = getPPAInfo(curOp);
-//         cur->delaysOut.emplace(pn, Delay{outpPPA.slowDelay,outpPPA.fastDelay});
-//         pn->isTrueLeaf = dyn_cast<seq::Clocked>(curOp);
-//         foundLeaves++;
+//     if (allOps.find(defOp) == allOps.end())
+//     {
+//         allOps.insert({defOp, llvm::SmallVector<HWNodeDelaysPtr>()});
 //     }
+//     allOps.at(defOp).push_back(cur);
 
 //     if (!cur->delaysOut.size())
 //     {
-//         for (auto result : curOp->getResults()) 
-//         {
+//         // Now traverse the new block (the current block)
+//         for (auto & use : curVal.getUses()) {
 
-//             for (auto & use : result.getUses())
+//             Operation * owner = use.getOwner();
+            
+//             if (InstanceOp instOp = dyn_cast<InstanceOp>(owner))
 //             {
-//                 Operation * owner = use.getOwner();
-            
-//                 if (InstanceOp instOp = dyn_cast<InstanceOp>(owner))
-//                 {
-//                     HWModulePPAModel & model = getModulesAnalysis(instOp);
-                    
-//                     Value & input = model.inpsList.at(use.getOperandNumber());
-//                     HWNodeDelaysPtr paths = model.rootBlocks.find(hash_value(input))->second;
-//                     for (auto & po : paths->delaysOut) {
-//                         if (!po.first->isTrueLeaf)
-//                         {
-//                             continue;
-//                         }
-//                         Delay poD = po.second;
-//                         HWPathNodePtr pn = cur->node;
-//                         pn->isTrueLeaf = true;
-//                         cur->delaysOut.emplace(pn, Delay{poD.slow, poD.fast});
-//                     }
-
-//                     for (uint i = 0; i < owner->getNumResults(); i++)
+//                 HWModulePPAModel & model = getModulesAnalysis(instOp);
+                
+//                 Value & input = model.inpsList.at(use.getOperandNumber());
+//                 HWNodeDelaysPtr paths = model.rootBlocks.find(hash_value(input))->second;
+//                 for (auto & po : paths->delaysOut) {
+//                     if (!po.first->isTrueLeaf)
 //                     {
-
-//                         auto cp = model.getMaxDelayRoot2Leaf(input, model.outpsList.at(i));
-//                         if (!cp.has_value()) {
-//                             // No path between root and leaf in the instance
-//                             continue;
-//                         }
-//                         OpResult res = owner->getResult(i);
-//                         dfsPathForward(res, i, cur, curInd);
+//                         continue;
 //                     }
-//                 } else
-//                 { // Otherwise, continue traversing
-//                     dfsPathForward(owner, use.getOperandNumber(), cur, curInd);
+//                     Delay poD = po.second;
+//                     HWPathNodePtr pn = cur->node;
+//                     pn->isTrueLeaf = true;
+//                     cur->delaysOut.emplace(pn, Delay{poD.slow, poD.fast});
 //                 }
-            
-            
+
+//                 for (uint i = 0; i < owner->getNumResults(); i++)
+//                 {
+
+//                     auto cp = model.getMaxDelayRoot2Leaf(input, model.outpsList.at(i));
+//                     if (!cp.has_value()) {
+//                         // No path between root and leaf in the instance
+//                         continue;
+//                     }
+//                     OpResult res = owner->getResult(i);
+//                     dfsPathForward(res, i, cur, curInd);
+//                 }
 //             }
 
+//             // Check if this use of cur is a leaf node (output or clocked op)
+//             else if (isa<OutputOp>(owner) || isa<seq::Clocked>(owner)) {
+//                 HWPathNodePtr pn = blk->second->node;
+//                 HWPPAInfo outpPPA = getPPAInfo(owner);
+//                 cur->delaysOut.emplace(pn, Delay{outpPPA.slowDelay,outpPPA.fastDelay});
+//                 pn->isTrueLeaf = dyn_cast<seq::Clocked>(owner);
+//                 foundLeaves++;
+
+//                 if (allOps.find(owner) == allOps.end())
+//                 {
+//                     allOps.insert({owner, llvm::SmallVector<HWNodeDelaysPtr>()});
+//                 }
+
+//             } else
+//             { // Otherwise, continue traversing
+//                 for (uint i = 0; i < owner->getNumResults(); i++)
+//                 {
+
+//                     OpResult res = owner->getResult(i);
+//                     dfsPathForward(res, i, cur, curInd);
+//                 }
+//             }
 //         }
 //     }
+
 //     if (parent == nullptr)
 //         return cur;
 
@@ -667,27 +689,165 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Value & next, int nextInd, HWNo
 //     return cur;
 // }
 
-void HWModulePPAModel::traverseFromLeaf(Value & leaf, int ind) {
-    if (leafBlocks.find(hash_value(leaf)) != leafBlocks.end())
+HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, HWNodeDelaysPtr & parent, int parInd)
+{
+    // Rename
+    Operation * curOp = next;
+    int curInd = nextInd;
+
+    auto blk = blocks.find(curOp);
+
+    // If we haven't traversed this node before, construct a block add it to blocks
+    if (blk == blocks.end())
     {
-        return;
+        HWPathNodePtr pn = std::make_shared<HWPathNode>();
+        pn->op = curOp;
+        pn->isTrueRoot = false;
+        pn->isTrueLeaf = false;
+        pn->ppaInfo = getPPAInfo(curOp);
+
+        HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
+        newBlock->node = pn;
+        newBlock->forwardIndices = llvm::SmallVector<int>{};
+        newBlock->backwardIndices = llvm::SmallVector<int>{};
+
+        blk = blocks.insert({curOp, newBlock}).first;
+    }
+    HWNodeDelaysPtr & cur = blk->second;
+
+    if ((parent != nullptr) && (isa<OutputOp>(curOp) || isa<seq::Clocked>(curOp))) {
+        HWPathNodePtr pn = cur->node;
+        // HWPPAInfo outpPPA = getPPAInfo(curOp);
+        if (!cur->delaysOut.size())
+        {
+            cur->delaysOut.push_back(DelayPath{pn, Delay{0,0}, -1, -1});
+        }
+        parent->delaysOut.push_back(DelayPath{pn, Delay{pn->ppaInfo.slowDelay, pn->ppaInfo.fastDelay}, parInd, curInd});
+        pn->isTrueLeaf |= isa<seq::Clocked>(curOp);
+        foundLeaves++;
+        return cur;
     }
 
-    HWNodeDelaysPtr nullPtr = nullptr;
-    HWNodeDelaysPtr leafBlock = dfsPathBackward(leaf, 0, nullPtr, -1);
-    leafBlocks.emplace(hash_value(leaf), leafBlock);
-};
+    // If there's still results we haven't traversed, continue traversing
+    // This will happen when an op is visited the first time and possibly 
+    // if it's revisisted WHILE it traverses other paths
+    if (cur->forwardIndices.size() < curOp->getNumResults())
+    {
+        for (auto result : curOp->getResults()) 
+        {
+            // If we've already traversed this result, don't do so again
+            // This prevents infinite loops
+            // It's okay if we get back here though, it just means that theres a path
+            // which we are traversing which passes through the module (this doesn't work
+            // for combinational loops but we assume that those don't exist in hw modules)
+            if (std::find(cur->forwardIndices.begin(), cur->forwardIndices.end(), result.getResultNumber()) != cur->forwardIndices.end())
+            {
+                continue;
+            }
+            cur->forwardIndices.push_back(result.getResultNumber());
+            for (auto & use : result.getUses())
+            {
+                Operation * owner = use.getOwner();
+                dfsPathForward(owner, use.getOperandNumber(), cur, result.getResultNumber());
+            }
+        }
+    }
+    if (parent == nullptr)
+        return cur;
+
+
+    if (InstanceOp instOp = dyn_cast<InstanceOp>(curOp))
+    {
+        HWModulePPAModel & model = getModulesAnalysis(instOp);
+        HWNodeDelaysPtr & root = model.blocks.at(model.analyzedOp.getOperation());
+        // Value & input = model.inpsList.at(curInd);
+
+        // Paths from root of instance to leaves of instance
+        for (auto & pathInternal : root->delaysOut)
+        {
+            if (pathInternal.fromInd != curInd)
+            {
+                continue;
+            }
+            if (pathInternal.node->isTrueLeaf)
+            {
+                Delay pathInternalD = pathInternal.delay;
+
+                // This is a path into the module
+                parent->delaysOut.push_back(DelayPath{cur->node, Delay{pathInternalD.slow, pathInternalD.fast}, parInd, pathInternal.fromInd});
+                continue;
+            }
+            
+            // Paths from leaves of instance to leaves of the module
+            for (auto & po : cur->delaysOut)
+            {
+                if ((pathInternal.toInd != po.fromInd))
+                {
+                    continue;
+                }
+                Delay pathInternalD = pathInternal.delay;
+                Delay poD = po.delay;
+
+                // This is a path through the module
+                parent->delaysOut.push_back(DelayPath{po.node, Delay{pathInternalD.slow + poD.slow, pathInternalD.fast + poD.fast}, parInd, po.toInd});
+            }
+        }
+        return cur;
+    }
+
+    int curSlow = cur->node->ppaInfo.slowDelay; 
+    int curFast = cur->node->ppaInfo.fastDelay;
+    for (auto & po : cur->delaysOut) {
+        Delay poD = po.delay;
+        int ind = po.toInd;
+        parent->delaysOut.push_back(DelayPath{po.node, Delay{poD.slow + curSlow, poD.fast + curFast}, parInd, ind});
+    }
+
+    return cur;
+}
+
+// void HWModulePPAModel::traverseFromLeaf(Value & leaf, int ind) {
+
+//     if (leafBlocks.find(hash_value(leaf)) != leafBlocks.end())
+//     {
+//         return;
+//     }
+
+//     HWNodeDelaysPtr nullPtr = nullptr;
+//     HWNodeDelaysPtr leafBlock = dfsPathBackward(leaf, 0, nullPtr, -1);
+//     leafBlocks.emplace(hash_value(leaf), leafBlock);
+// };
 
 void HWModulePPAModel::traverseFromRoot(Value & root, int ind) {
-    // I don't think this should ever evaluate to true.
-    if (rootBlocks.find(hash_value(root)) != rootBlocks.end())
+
+    auto rootBlk = blocks.find(analyzedOp.getOperation());
+    if (rootBlk == blocks.end())
+    {
+        HWPathNodePtr pn = std::make_shared<HWPathNode>();
+        pn->op = analyzedOp.getOperation();
+        pn->isTrueRoot = false;
+        pn->isTrueLeaf = false;
+        pn->ppaInfo = getPPAInfo(analyzedOp.getOperation());
+
+        HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
+        newBlock->node = pn;
+        newBlock->forwardIndices = llvm::SmallVector<int>{};
+        newBlock->backwardIndices = llvm::SmallVector<int>{};
+
+        rootBlk = blocks.insert({analyzedOp.getOperation(), newBlock}).first;
+    }
+    HWNodeDelaysPtr & cur = rootBlk->second;
+
+    if (std::find(cur->forwardIndices.begin(), cur->forwardIndices.end(), ind) != cur->forwardIndices.end()) 
     {
         return;
     }
-
-    HWNodeDelaysPtr nullPtr = nullptr;
-    HWNodeDelaysPtr rootBlock = dfsPathForward(root, 0, nullPtr, -1);
-    rootBlocks.insert({hash_value(root), rootBlock});
+    cur->forwardIndices.push_back(ind);
+    for (auto & use : root.getUses())
+    {
+        Operation * owner = use.getOwner();
+        dfsPathForward(owner, use.getOperandNumber(), cur, ind);
+    }
 };
 
 std::mutex debugWrLock;
@@ -706,85 +866,74 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
     for (size_t i = 0; i < mop.getNumInputPorts(); i++)
     {
         BlockArgument res = mop.getArgumentForInput(i);
-        inpsList.push_back(static_cast<Value>(res));
-        traverseFromRoot(static_cast<Value&>(res), i);
+        inpsList.push_back(static_cast<Value>(res));        
     }
 
     mop->walk([&](Operation * op) {
 
         seq::Clocked clockedOp = dyn_cast<seq::Clocked>(op);
+        HWNodeDelaysPtr nullPtr = nullptr;
         if (clockedOp)
         {
-            for (uint i = 0; i < op->getNumResults(); i++)
-            {
-                OpResult result = op->getResult(i);
-                traverseFromRoot(static_cast<Value&>(result), i);
-            }
-            for (uint i = 0; i < op->getNumOperands(); i++)
-            {
-                Value operand = op->getOperand(i);
-                traverseFromLeaf(operand, i);
-            }
+            dfsPathForward(op, -1, nullPtr, -1);
+            dfsPathBackward(op, -1, nullPtr, -1);
             return;
         }
         ConstantOp constOp = dyn_cast<ConstantOp>(op);
         if (constOp)
         {
-            for (uint i = 0; i < op->getNumResults(); i++)
-            {
-                OpResult result = op->getResult(i);
-                traverseFromRoot(static_cast<Value&>(result), i);
-            }
+            dfsPathForward(op, -1, nullPtr, -1);
             return;
         }
         OutputOp outputOp = dyn_cast<OutputOp>(op);
         if (outputOp)
         {
-            for (uint i = 0; i < op->getNumOperands(); i++)
-            {
-                Value operand = op->getOperand(i);
-                outpsList.push_back(operand);
-                traverseFromLeaf(operand, i);
-            }
+            this->analyzedOutputOp = outputOp;
+            dfsPathBackward(op, -1, nullPtr, -1);
+            return; 
         }
     });
 
     
     llvm::errs() << "[PPA] Module " << mop.getName() << '\n';
-    llvm::errs() << "[PPA] have " << blocks.size() << " blocks\n";
-    llvm::errs() << "[PPA] have " << foundLeaves << " found leaves\n";
-    llvm::errs() << "[PPA] have " << leafBlocks.size() << " blocks leaves\n";
-    for (auto & lb : leafBlocks)
-    {
-        llvm::errs() << lb.second->node->val << '\n';
-    }
-    llvm::errs() << "[PPA] have " << rootBlocks.size() << " blocks roots\n";
-    for (auto & rb : rootBlocks)
-    {
-        llvm::errs() << rb.second->node->val << '\n';
-    }
+    // llvm::errs() << "[PPA] have " << blocks.size() << " blocks\n";
+    // llvm::errs() << "[PPA] have " << foundLeaves << " found leaves\n";
+    // llvm::errs() << "[PPA] have " << leafBlocks.size() << " blocks leaves\n";
+    // for (auto & lb : leafBlocks)
+    // {
+    //     llvm::errs() << lb.second->node->val << '\n';
+    // }
+    // llvm::errs() << "[PPA] have " << rootBlocks.size() << " blocks roots\n";
+    // for (auto & rb : rootBlocks)
+    // {
+    //     llvm::errs() << rb.second->node->val << '\n';
+    // }
 
-    for (auto & rb : rootBlocks)
-    {
-        for (auto & lb : leafBlocks)
-        {
-            std::optional<Delay> d = getMaxDelayRoot2Leaf(rb.second->node->val, lb.second->node->val);
-            if (d)
-            {
-                llvm::errs() << "[PPA] Max delay from root " << rb.second->node->val << " to leaf " << lb.second->node->val << " is slow: " << d->slow << ", fast: " << d->fast << '\n';
-            }
-            d = getMaxDelayLeafFromRoot(rb.second->node->val, lb.second->node->val);
-            if (d)
-            {
-                llvm::errs() << "[PPA] Max delay to leaf " << lb.second->node->val << " from root " << rb.second->node->val << " is slow: " << d->slow << ", fast: " << d->fast << '\n';
-                llvm::errs() << "\n";
-            }
-        }
-    }
+    // for (auto & rb : rootBlocks)
+    // {
+    //     for (auto & lb : leafBlocks)
+    //     {
+    //         std::optional<Delay> d = getMaxDelayRoot2Leaf(rb.second->node->val, lb.second->node->val);
+    //         if (d)
+    //         {
+    //             llvm::errs() << "[PPA] Max delay from root " << rb.second->node->val << " to leaf " << lb.second->node->val << " is slow: " << d->slow << ", fast: " << d->fast << '\n';
+    //         }
+    //         d = getMaxDelayLeafFromRoot(rb.second->node->val, lb.second->node->val);
+    //         if (d)
+    //         {
+    //             llvm::errs() << "[PPA] Max delay to leaf " << lb.second->node->val << " from root " << rb.second->node->val << " is slow: " << d->slow << ", fast: " << d->fast << '\n';
+    //             llvm::errs() << "\n";
+    //         }
+    //     }
+    // }
 
     for (auto & block : blocks) {
 
-        llvm::errs() << "[PPA] Node " << block.second->node->val << '\n';
+        if (isa<HWModuleOp>(block.second->node->op)) {
+            llvm::errs() << "[PPA] Node Block input\n";
+        } else {
+            llvm::errs() << "[PPA] Node " << *block.second->node->op << '\n';
+        }
         // if (block.second->node->op)
         // {
         //     block.second->node->op->dumpPretty();
@@ -794,22 +943,26 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
         // }
 
         for (auto & pi : block.second->delaysIn) {
-            llvm::errs() << "\n    delayIn from " << pi.first->val;
+            if (isa<HWModuleOp>(pi.node->op)) {
+                llvm::errs() << "\n    delayIn from module input is: " << pi.delay.fast << '\n';
+                continue;
+            }
+            llvm::errs() << "\n    delayIn from " << *pi.node->op;
             // if (pi.first->op) { 
             //     pi.first->op->dumpPretty();
             // } else {
             //     llvm::errs() << "mod inp";
             // }
-            llvm::errs() << " is: " << pi.second.fast << '\n';
+            llvm::errs() << " is: " << pi.delay.fast << '\n';
         }
         for (auto & po : block.second->delaysOut) {
-            llvm::errs() << "\n    delayOut to " << po.first->val;
+            llvm::errs() << "\n    delayOut to " << *po.node->op;
             // if (po.first->op) {
             //     po.first->op->dumpPretty();
             // } else {
             //     llvm::errs() << "mod out";
             // }
-            llvm::errs() << " is: " << po.second.fast << '\n';
+            llvm::errs() << " is: " << po.delay.fast << '\n';
         }
     }
     llvm::errs() << "\n\n\n";
