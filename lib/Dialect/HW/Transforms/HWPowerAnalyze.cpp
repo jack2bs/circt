@@ -9,11 +9,14 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/PortImplementation.h"
 #include "circt/Dialect/Seq/SeqOpInterfaces.h"
 #include "circt/Support/LLVM.h"
 #include "mlir-c/IR.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/IR/Operation.h"
+#include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/Hashing.h"
@@ -21,8 +24,12 @@
 #include "llvm/CodeGen/StackMaps.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/Timer.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TableGen/TableGenBackend.h"
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <fstream>
 #include <list>
 #include <memory>
@@ -36,9 +43,13 @@
 #include <utility>
 #include <vector>
 
+#include <thread>
+#include <condition_variable>
+
 #include "circt/Dialect/HW/HWInstanceGraph.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/Support/raw_ostream.h"
@@ -47,6 +58,11 @@
 #include "mlir/Pass/AnalysisManager.h"
 
 #include "mlir/IR/OperationSupport.h"
+
+#include "llvm/Support/JSON.h"
+#include <fstream>
+#include <cstdlib>
+
 namespace circt {
 namespace hw {
 #define GEN_PASS_DEF_HWPOWERANALYZE
@@ -60,34 +76,119 @@ using namespace hw;
 namespace {
 
 struct HWPPAInfo {
-    int fastDelay;
-    int fastPower;
-    int fastArea;
-    int slowDelay;
-    int slowPower;
-    int slowArea;
+    double delay = 0.0;
+    double area = 0.0;
+    double lkgpwr = 0.0;
+    double dynengy = 0.0;
+    int in1Width = 0;
+    int auxWidth = 0;
+
+    bool operator>(HWPPAInfo const & other) const
+    {
+        if (this->delay == other.delay)
+        {
+            return this->area > other.area;
+        }
+        return this->delay > other.delay;
+    }
+};
+using HWPPASet = std::set<HWPPAInfo, std::greater<>>;
+using HWPPASetPtr = std::shared_ptr<HWPPASet>;
+
+class HWPPAGroup {
+public:
+    void addInfo(HWPPAInfo & ppaInfo)
+    {
+        for (auto i = m_infoSets.begin(); i != m_infoSets.end(); i++) {
+            auto & auxWidthVec = *i;
+            int existingInWid = auxWidthVec.at(0)->begin()->in1Width;
+            if (existingInWid < ppaInfo.in1Width)
+            {
+                continue;
+            }
+            if (existingInWid > ppaInfo.in1Width)
+            {
+                auto newSetVec = m_infoSets.insert(i, std::vector<HWPPASetPtr>());
+                auto newSet = newSetVec->emplace_back(std::make_shared<HWPPASet>());
+                newSet->insert(ppaInfo);
+                return;
+            }
+            for (auto j = auxWidthVec.begin(); j != auxWidthVec.end(); j++)
+            {
+                auto & set = *j;
+                if (set->begin()->auxWidth < ppaInfo.auxWidth)
+                {
+                    continue;
+                }
+                if (set->begin()->auxWidth > ppaInfo.auxWidth)
+                {
+                    auto newSet = auxWidthVec.emplace_back(std::make_shared<HWPPASet>());
+                    newSet->insert(ppaInfo);
+                    return;
+                }
+                set->insert(ppaInfo);
+                return;
+            }
+            auto newSet = auxWidthVec.emplace_back(std::make_shared<HWPPASet>());
+            newSet->insert(ppaInfo);
+            return;
+        }
+        auto & newSetVec = m_infoSets.emplace_back();
+        auto & newSet = newSetVec.emplace_back(std::make_shared<HWPPASet>());
+        newSet->insert(ppaInfo);
+    }
+
+    HWPPASetPtr getBestMatch(int in1Width, int auxWidth) const
+    {
+        for (auto & auxWidthVec : m_infoSets) {
+            int existingInWid = auxWidthVec.at(0)->begin()->in1Width;
+            if (existingInWid < in1Width)
+            {
+                continue;
+            }
+            for (auto & set : auxWidthVec)
+            {
+                if (set->begin()->auxWidth < auxWidth)
+                {
+                    continue;
+                }
+                return set;
+            }
+        }
+        llvm::errs() << "[PPAAnalyze] No profile can handle the inputs to getBestMatch which are: " << in1Width << " and " << auxWidth << '\n';
+        llvm::errs() << "  For group: " << m_infoSets.begin()->begin()->get()->begin()->delay << '\n';
+        return nullptr;
+    }
+
+    std::vector<std::vector<HWPPASetPtr>> m_infoSets;
+};
+using HWPPAGroupPtr = std::shared_ptr<HWPPAGroup>;
+
+struct HWPPAData {
+    std::unordered_map<std::string, HWPPAGroup> data;
 };
 
 struct HWPathNode {
     Operation * op;
     Value val;
-    bool isTrueRoot;
-    bool isTrueLeaf;
-    HWPPAInfo ppaInfo;
+    // bool isTrueRoot;
+    // bool isTrueLeaf;
+    HWPPASetPtr ppaInfo;
 };
 using HWPathNodePtr = std::shared_ptr<HWPathNode>;
 
 // using HWPath = std::list<HWPathNodePtr>;
 
-struct Delay 
-{
-    int slow = 0;
-    int fast = 0;
-};
+// struct Delay 
+// {
+//     int slow = 0;
+//     int fast = 0;
+// };
 struct DelayPath
 {
     HWPathNodePtr node;
-    Delay delay;
+    double delay;
+    bool isTrue;
     int fromInd;
     int toInd;
 };
@@ -110,10 +211,17 @@ struct HWModulePPAModel {
     HWNodeDelaysPtr dfsPathForward(Operation * next, int nextInd, HWNodeDelaysPtr & parent, int parInd);
     HWNodeDelaysPtr dfsPathBackward(Operation * next, int nextInd, HWNodeDelaysPtr & child, int chiInd);
     // HWModulePPAModel(Operation *moduleOp, mlir::AnalysisManager &am);
-    HWModulePPAModel(Operation *moduleOp);
-    static HWModulePPAModel & getModel(Operation * moduleOp);
+    HWModulePPAModel(Operation *moduleOp, const HWPPAData * ppaDataPtr);
+    static HWModulePPAModel & getModel(Operation * moduleOp, const HWPPAData * ppaData);
 
-    static HWPPAInfo getPPAInfo(Operation * op);
+    static bool isZeroCostOp(Operation * op);
+    struct OperandInfo 
+    {
+        bool isConstant;
+        int width;
+    };
+    static OperandInfo getOperandInfo(Value operand);
+    HWPPASetPtr getPPAInfo(Operation * op);
 
     // std::optional<Delay> getMaxDelayRoot2Leaf(Value & root, Value & leaf);
     // std::optional<Delay> getMaxDelayLeafFromRoot(Value & root, Value & leaf);
@@ -150,6 +258,10 @@ private:
     OutputOp analyzedOutputOp;
     // mlir::AnalysisManager am;
 
+    const HWPPAData * ppaData;
+
+    bool finished = false;
+
     int foundLeaves = 0;
 
 };
@@ -171,16 +283,85 @@ struct VCDData{
     std::vector<std::string> hierarchyStack;
 };
 
-HWModulePPAModel & HWModulePPAModel::getModel(Operation * moduleOp)
+HWModulePPAModel & HWModulePPAModel::getModel(Operation * moduleOp, const HWPPAData * ppaData)
 {
     static std::unordered_map<Operation *, HWModulePPAModel> moduleModels;
-    auto it = moduleModels.find(moduleOp);
-    if (it == moduleModels.end())
+    static std::unordered_set<Operation *> exists;
+
+    std::mutex mtx;
+    std::unique_lock<std::mutex> lock(mtx);
+
+    auto it = exists.find(moduleOp);
+    if (it == exists.end())
     {
-        it = moduleModels.insert({moduleOp, HWModulePPAModel(moduleOp)}).first;
+        exists.insert(moduleOp);
+        lock.unlock();
+        moduleModels.insert({moduleOp, HWModulePPAModel(moduleOp, ppaData)});
+        return moduleModels.at(moduleOp);
     }
-    return it->second;
+
+    while (moduleModels.find(moduleOp) == moduleModels.end() || !moduleModels.at(moduleOp).finished)
+    {
+        lock.unlock();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        lock.lock();
+    }
+    lock.unlock();
+
+    return moduleModels.at(moduleOp);
 }
+
+// HWModulePPAModel & HWModulePPAModel::getModel(Operation * moduleOp)
+// {
+//     // Maps and synchronization primitives are static so they are shared across
+//     // threads. A per-module "constructing" flag + condition_variable is used so
+//     // multiple threads can construct different modules in parallel while callers
+//     // asking for a module already under construction will wait for completion.
+//     static std::mutex gModelsMutex;
+//     static std::unordered_map<Operation *, HWModulePPAModel> moduleModels;
+//     static std::unordered_set<Operation *> constructing;
+//     static std::unordered_map<Operation *, std::unique_ptr<std::condition_variable>> condVars;
+//     static std::unordered_map<Operation *, std::thread::id> constructingThread;
+
+//     std::unique_lock<std::mutex> lk(gModelsMutex);
+
+//     // If already constructed, return immediately.
+//     auto it = moduleModels.find(moduleOp);
+//     if (it != moduleModels.end())
+//         return it->second;
+
+//     // If another thread is constructing this module, wait for it to finish.
+//     if (constructing.count(moduleOp)) {
+//         auto condIt = condVars.find(moduleOp);
+//         if (condIt == condVars.end())
+//             condIt = (condVars.emplace(moduleOp, std::make_unique<std::condition_variable>())).first;
+//         // Wait until the module has been inserted into moduleModels.
+//         condIt->second->wait(lk, [&] { return moduleModels.find(moduleOp) != moduleModels.end(); });
+//         return moduleModels.find(moduleOp)->second;
+//     }
+
+//     // Mark this module as being constructed by this thread.
+//     constructing.insert(moduleOp);
+//     auto condIt = condVars.find(moduleOp);
+//     if (condIt == condVars.end())
+//         condIt = (condVars.emplace(moduleOp, std::make_unique<std::condition_variable>())).first;
+//     constructingThread[moduleOp] = std::this_thread::get_id();
+
+//     // Unlock while constructing to allow other threads to proceed in parallel.
+//     lk.unlock();
+//     HWModulePPAModel model(moduleOp);
+//     lk.lock();
+
+//     // Insert the constructed model into the shared map.
+//     auto inserted = moduleModels.emplace(moduleOp, std::move(model)).first;
+
+//     // Clear constructing flag and notify any waiters.
+//     constructing.erase(moduleOp);
+//     constructingThread.erase(moduleOp);
+//     condIt->second->notify_all();
+
+//     return inserted->second;
+// }
 
 struct HWPowerAnalyzePass
     : public circt::hw::impl::HWPowerAnalyzeBase<HWPowerAnalyzePass> {
@@ -190,6 +371,7 @@ struct HWPowerAnalyzePass
     void parseVCD();
     void walkOps();
     void calcSwitchingActivity();
+    void parsePPAJson(const std::string &jsonPath, HWPPAData &ppaData);
 
     std::unordered_map<std::string, SignalInfoPtr> hierarchyToSignal;
 
@@ -204,13 +386,14 @@ private:
     void parseVCDBitvectorLine(VCDData & v, std::istringstream & iss, std::string & token);
     void parseVCDBooleanLine(VCDData & v, std::string & token);
     void parseVCDVar(VCDData & v, std::istringstream & iss);
+    size_t indexFromArgs(uint16_t in1Width, uint16_t auxWidth = 0);
 
 };
 }
 
 void HWModulePPAModel::getSibMods()
 {
-    llvm::errs() << "[PPA] Getting sibling HWModuleOps " << analyzedOp << '\n';
+    // llvm::errs() << "[PPA] Getting sibling HWModuleOps " << analyzedOp << '\n';
     Block * topBlock = analyzedOp->getBlock();
     for (Operation & module : topBlock->getOperations())
     {
@@ -226,39 +409,239 @@ void HWModulePPAModel::getSibMods()
     processedSiblings = true;
 }
 
-HWPPAInfo HWModulePPAModel::getPPAInfo(Operation * op)
+bool HWModulePPAModel::isZeroCostOp(Operation * op)
+{
+    return llvm::dyn_cast<comb::ConcatOp>(op) ||
+           llvm::dyn_cast<comb::ReplicateOp>(op) ||
+           llvm::dyn_cast<comb::ReverseOp>(op) ||
+           llvm::dyn_cast<comb::ExtractOp>(op) ||
+           llvm::dyn_cast<WireOp>(op) ||
+           llvm::dyn_cast<OutputOp>(op) ||
+           llvm::dyn_cast<HWModuleOp>(op) ||
+           llvm::dyn_cast<InstanceOp>(op) ||
+           llvm::dyn_cast<BitcastOp>(op) ||
+           llvm::dyn_cast<ConstantOp>(op) ||
+           llvm::dyn_cast<seq::ConstClockOp>(op) ||
+           llvm::dyn_cast<seq::FromClockOp>(op) ||
+           llvm::dyn_cast<seq::ToClockOp>(op) ||
+           llvm::dyn_cast<seq::InitialOp>(op) ||
+           llvm::dyn_cast<seq::FromImmutableOp>(op) ||
+           llvm::dyn_cast<seq::YieldOp>(op);
+}
+
+HWModulePPAModel::OperandInfo HWModulePPAModel::getOperandInfo(Value operand)
+{
+    Operation * ownOp = operand.getDefiningOp();
+
+    // Presumably block input
+    if (!ownOp)
+    {
+        return { false, static_cast<int>(operand.getType().getIntOrFloatBitWidth()) };
+    }
+
+    if (llvm::dyn_cast<WireOp>(ownOp) || llvm::dyn_cast<comb::ReverseOp>(ownOp))
+    {
+        return getOperandInfo(ownOp->getOperand(0));
+    }
+    if (llvm::dyn_cast<comb::ReplicateOp>(ownOp) || llvm::dyn_cast<comb::ExtractOp>(ownOp))
+    {
+        OperandInfo retVal = getOperandInfo(ownOp->getOperand(0));
+        retVal.width = operand.getType().getIntOrFloatBitWidth();
+        return retVal;
+    }
+
+    OperandInfo retVal;
+    retVal.isConstant = false;
+    if (!operand.getType().isIntOrIndexOrFloat())
+    { 
+        retVal.width = 1;
+    } else {
+        retVal.width = operand.getType().getIntOrFloatBitWidth();
+    }
+
+    if (llvm::dyn_cast<ConstantOp>(ownOp))
+    {
+        retVal.isConstant = true;
+        return retVal;
+    }
+
+    if (llvm::dyn_cast<comb::ConcatOp>(ownOp))
+    {
+        int nonConstWidth = retVal.width;
+        for (uint i = 0; i < ownOp->getNumOperands(); i++) {
+            Value subOperand = ownOp->getOperand(i);
+            OperandInfo subOpInfo = getOperandInfo(subOperand);
+            if (!subOpInfo.isConstant) { break; }
+            nonConstWidth -= subOpInfo.width;
+        }
+        retVal.width = nonConstWidth;
+    }
+    return retVal;
+}
+
+static HWPPASetPtr zeroedSet = std::make_shared<HWPPASet>(HWPPASet{{
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+}});
+
+HWPPASetPtr HWModulePPAModel::getPPAInfo(Operation * op)
 {
     if (!op) {
-        return 
-        {
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
-        };
+        return zeroedSet;
     }
-    if (llvm::dyn_cast<HWModuleOp>(op) || llvm::dyn_cast<OutputOp>(op)) {
-        return
-        {
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
-        };
+    if (isZeroCostOp(op)) {
+        return zeroedSet;
     }
-    return 
+
+    if (llvm::dyn_cast<comb::AddOp>(op)) 
+    { 
+        // TECHNICALLY ADDS ARE VARIADIC BUT THEYRE A SINGLE WIDTH IN HWIR SO THIS IS FINE
+        // THIS IS WHAT WOULD BE CORRECT FOR FIRRTL AND SINCE THIS MAY BE PORTED TO FIRRTL THIS IS PREFERRED
+        // SAME FOR OTHERS VARIADIC OPS HERE
+        return ppaData->data.at("add").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width); 
+    } 
+    if (llvm::dyn_cast<comb::AndOp>(op)) 
+    { 
+        return ppaData->data.at("and").getBestMatch(1, 0); 
+    }
+    if (llvm::dyn_cast<comb::DivSOp>(op) || llvm::dyn_cast<comb::DivUOp>(op)) 
+    { 
+        return ppaData->data.at("div").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width); 
+    }
+    if (llvm::dyn_cast<comb::ICmpOp>(op) || llvm::dyn_cast<EnumCmpOp>(op)) 
+    { 
+        return ppaData->data.at("equal").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            0); 
+    }
+    if (llvm::dyn_cast<comb::ModSOp>(op) || llvm::dyn_cast<comb::ModUOp>(op))
+    { 
+        return ppaData->data.at("mod").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width); 
+    }
+    if (llvm::dyn_cast<comb::MulOp>(op)) 
+    { 
+        return ppaData->data.at("mul").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width); 
+    }
+    if (llvm::dyn_cast<comb::MuxOp>(op)) 
+    { 
+        return ppaData->data.at("mux").getBestMatch(
+            getOperandInfo(op->getOperand(1)).width,
+            getOperandInfo(op->getOperand(0)).width); // cond is the 0th operand
+    }
+    if (llvm::dyn_cast<comb::OrOp>(op)) 
+    { 
+        return ppaData->data.at("or").getBestMatch(1, 0); 
+    }
+    if (llvm::dyn_cast<comb::ParityOp>(op) || llvm::dyn_cast<comb::XorOp>(op)) 
+    { 
+        return ppaData->data.at("xor").getBestMatch(1, 0); 
+    }
+    // TODO : Strength Reduction
+    if (llvm::dyn_cast<comb::ShlOp>(op))
     {
-        1,
-        1,
-        1,
-        1,
-        1,
-        1
-    };
+        return ppaData->data.at("shift_l").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width);
+    }
+    if (llvm::dyn_cast<comb::ShrSOp>(op))
+    {
+        return ppaData->data.at("shift_r").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width);
+    }
+    if (llvm::dyn_cast<comb::ShrUOp>(op))
+    {
+        return ppaData->data.at("shift_br").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width);
+    }
+    if (llvm::dyn_cast<comb::SubOp>(op))
+    { 
+        return ppaData->data.at("sub").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            getOperandInfo(op->getOperand(1)).width); 
+    }
+    if (llvm::dyn_cast<comb::TruthTableOp>(op)) 
+    { 
+        return ppaData->data.at("mux").getBestMatch(
+            getOperandInfo(op->getOperand(0)).width,
+            1); 
+    }
+
+    if (llvm::dyn_cast<seq::ClockGateOp>(op))
+    {
+        return ppaData->data.at("mux").getBestMatch(
+            1,
+            1);
+    }
+    if (llvm::dyn_cast<seq::ClockInverterOp>(op))
+    {
+        return ppaData->data.at("not").getBestMatch(
+            1,
+            0);
+    }
+    if (llvm::dyn_cast<seq::ClockMuxOp>(op))
+    {
+        return ppaData->data.at("mux").getBestMatch(
+            1,
+            1);
+    }
+    if (llvm::dyn_cast<seq::CompRegOp>(op) || llvm::dyn_cast<seq::CompRegClockEnabledOp>(op) ||
+        llvm::dyn_cast<seq::FirRegOp>(op)  || llvm::dyn_cast<seq::ShiftRegOp>(op))
+    {
+        return ppaData->data.at("reg_pos").getBestMatch(
+            1,
+            0);
+    }
+
+
+    // TODO: HANDLE FIFOs and MEMs
+    // seq::FIFOOp
+    // seq::FirMemOp
+    // seq::FirMemReadOp
+    // seq::FirMemReadWriteOp
+    // seq::FirMemWriteOp
+    // seq::HLMemOp
+    // seq::ReadPortOp
+    // seq::WritePortOp
+
+    // TODO: HANDLE HW OPS
+    // HWGeneratorSchemaOp
+    // HWModuleExternOp
+    // HWModuleGeneratedOp
+    // HierPathOp
+    // InstanceChoiceOp
+    // TriggeredOp
+    // EnumConstantOp
+    // AggregateConstantOp
+    // StructCreateOp
+    // StructExplodeOp
+    // StructExtractOp
+    // StructInjectOp
+    // UnionCreateOp
+    // UnionExtractOp
+    // TypeScopeOp
+    // TypedeclOp
+    // ArrayCreateOp
+    // ArrayConcatOp
+    // ArrayGetOp
+    // ArrayInjectOp
+    // ArraySliceOp
+    // ParamValueOp
+
+    return zeroedSet;
 }
 
 // std::optional<Delay> HWModulePPAModel::getMaxDelayRoot2Leaf(Value & root, Value & leaf)
@@ -321,7 +704,7 @@ HWModulePPAModel & HWModulePPAModel::getModulesAnalysis(InstanceOp & op)
     {
         model = instances.emplace(
             op.getModuleName(),
-            HWModulePPAModel::getModel(siblings.find(op.getModuleName())->second)
+            HWModulePPAModel::getModel(siblings.find(op.getModuleName())->second, ppaData)
         ).first;
 
         // HWModuleOp mop = model->second.analyzedOp;
@@ -349,8 +732,8 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Operation * next, int nextInd,
     {
         HWPathNodePtr pn = std::make_shared<HWPathNode>();
         pn->op = curOp;
-        pn->isTrueRoot = false;
-        pn->isTrueLeaf = false;
+        // pn->isTrueRoot = false;
+        // pn->isTrueLeaf = false;
         pn->ppaInfo = getPPAInfo(curOp);
 
         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
@@ -366,84 +749,91 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Operation * next, int nextInd,
     if ((child != nullptr) && (isa<HWModuleOp>(curOp) || isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp))) {
         HWPathNodePtr pn = cur->node;
         // HWPPAInfo outpPPA = getPPAInfo(curOp);
+        bool isTrue = (isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp));
         if (!cur->delaysIn.size())
         {
-            cur->delaysIn.push_back(DelayPath{pn, Delay{0,0}, -1, -1});
+            
+            cur->delaysIn.push_back(DelayPath{pn, 0, isTrue, -1, -1});
+            
         }
         // child->delaysIn.push_back(DelayPath{pn, Delay{pn->ppaInfo.slowDelay, pn->ppaInfo.fastDelay}, curInd, chiInd});
-        pn->isTrueRoot |= (isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp));
+        // pn->isTrueRoot |= (isa<seq::Clocked>(curOp) || isa<ConstantOp>(curOp));
         return cur;
     }
 
-    if (cur->backwardIndices.size() >= curOp->getNumOperands()) 
+    if (cur->backwardIndices.size() < curOp->getNumOperands()) 
     {
-        return cur;
-    }
-    for (uint i = 0; i < curOp->getNumOperands(); i++)
-    {
-        if (std::find(cur->backwardIndices.begin(), cur->backwardIndices.end(), i) != cur->backwardIndices.end())
+    
+        for (int i = 0; i < curOp->getNumOperands(); i++)
         {
-            continue;
-        }
-        cur->backwardIndices.push_back(i);
-
-        Value operand = curOp->getOperand(i);
-        Operation * defOp = operand.getDefiningOp();
-        OpResult res = dyn_cast<OpResult>(operand);
-
-        HWNodeDelaysPtr par = dfsPathBackward(defOp, i, cur, curInd);
-
-        if (defOp && isa<InstanceOp>(defOp))
-        {
-            InstanceOp instOp = dyn_cast<InstanceOp>(defOp);
-            HWModulePPAModel & model = getModulesAnalysis(instOp);
-            HWNodeDelaysPtr & outp = model.blocks.at(model.analyzedOutputOp.getOperation());
-
-            for (auto & pathInternal : outp->delaysIn)
+            if (std::find(cur->backwardIndices.begin(), cur->backwardIndices.end(), i) != cur->backwardIndices.end())
             {
-                if (pathInternal.toInd != res.getResultNumber())
-                {
-                    continue;
-                }
-                if (pathInternal.node->isTrueRoot)
-                {
-                    Delay pathInternalD = pathInternal.delay;
+                continue;
+            }
+            cur->backwardIndices.push_back(i);
 
-                    cur->delaysIn.push_back(DelayPath{cur->node, Delay{pathInternalD.slow, pathInternalD.fast}, pathInternal.toInd, curInd});
-                    continue;
-                }
-                for (auto & po : par->delaysIn)
+            Value operand = curOp->getOperand(i);
+            Operation * defOp = operand.getDefiningOp();
+            OpResult res = dyn_cast<OpResult>(operand);
+
+            HWNodeDelaysPtr par = dfsPathBackward(defOp, i, cur, curInd);
+
+            if (defOp && isa<InstanceOp>(defOp))
+            {
+                // llvm::errs() << "WE GOT HERE TEAM! curop is " << *curOp << " operand: " << i << " from result: " << res.getResultNumber() << "\n";
+
+                InstanceOp instOp = dyn_cast<InstanceOp>(defOp);
+                HWModulePPAModel & model = getModulesAnalysis(instOp);
+                HWNodeDelaysPtr & outp = model.blocks.at(model.analyzedOutputOp.getOperation());
+
+                for (auto & pathInternal : outp->delaysIn)
                 {
-                    if ((pathInternal.fromInd != po.toInd))
+                    // llvm::errs() << pathInternal.node->op->getName() << " " << pathInternal.isTrue << " " << pathInternal.toInd << " " << pathInternal.fromInd << " " << '\n';
+                    if (pathInternal.toInd != res.getResultNumber())
                     {
                         continue;
                     }
-                    Delay pathInternalD = pathInternal.delay;
-                    Delay poD = po.delay;
+                    if (pathInternal.isTrue)
+                    {
+                        double pathInternalD = pathInternal.delay;
 
-                    cur->delaysIn.push_back(DelayPath{po.node, Delay{pathInternalD.slow + poD.slow, pathInternalD.fast + poD.fast}, po.fromInd, curInd});
+                        cur->delaysIn.push_back(DelayPath{par->node, pathInternalD, true, pathInternal.toInd, i});
+                        continue;
+                    }
+                    for (auto & po : par->delaysIn)
+                    {
+                        if ((pathInternal.fromInd != po.toInd))
+                        {
+                            continue;
+                        }
+                        double pathInternalD = pathInternal.delay;
+                        double poD = po.delay;
+
+                        cur->delaysIn.push_back(DelayPath{po.node, pathInternalD + poD, po.isTrue, po.fromInd, i});
+                    }
+
                 }
 
+                continue;
             }
-
-            continue;
-        }
-        if (defOp && (isa<HWModuleOp>(defOp) || isa<seq::Clocked>(defOp) || isa<ConstantOp>(defOp)))
-        {
-            int curSlow = par->node->ppaInfo.slowDelay;
-            int curFast = par->node->ppaInfo.fastDelay;
-            cur->delaysIn.push_back(DelayPath{par->node, Delay{curSlow, curFast}, static_cast<int>(res.getResultNumber()), curInd});
-            
-            continue;
-        }
-        for (auto & pi : par->delaysIn)
-        {
-            int curSlow = par->node->ppaInfo.slowDelay;
-            int curFast = par->node->ppaInfo.fastDelay;
-            Delay piD = pi.delay;
-            cur->delaysIn.push_back(DelayPath{pi.node, Delay{piD.slow + curSlow, piD.fast + curFast }, pi.fromInd, curInd});
+            if (defOp && (isa<HWModuleOp>(defOp) || isa<seq::Clocked>(defOp) || isa<ConstantOp>(defOp)))
+            {
+                double curDelay = par->node->ppaInfo->begin()->delay;
+                bool isTrue = (isa<seq::Clocked>(defOp) || isa<ConstantOp>(defOp));
+                cur->delaysIn.push_back(DelayPath{par->node, curDelay, isTrue, static_cast<int>(res.getResultNumber()), i});
+                
+                continue;
+            }
+            for (auto & pi : par->delaysIn)
+            {
+                double curDelay = par->node->ppaInfo->begin()->delay;
+                double piD = pi.delay;
+                cur->delaysIn.push_back(DelayPath{pi.node, piD + curDelay, pi.isTrue, pi.fromInd, i});
+            }
         }
     }
+    return cur;
+
 }
 
 // HWNodeDelaysPtr HWModulePPAModel::dfsPathBackward(Value & next, int nextInd, HWNodeDelaysPtr & child, int chiInd)
@@ -702,8 +1092,8 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, 
     {
         HWPathNodePtr pn = std::make_shared<HWPathNode>();
         pn->op = curOp;
-        pn->isTrueRoot = false;
-        pn->isTrueLeaf = false;
+        // pn->isTrueRoot = false;
+        // pn->isTrueLeaf = false;
         pn->ppaInfo = getPPAInfo(curOp);
 
         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
@@ -718,12 +1108,13 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, 
     if ((parent != nullptr) && (isa<OutputOp>(curOp) || isa<seq::Clocked>(curOp))) {
         HWPathNodePtr pn = cur->node;
         // HWPPAInfo outpPPA = getPPAInfo(curOp);
+        bool isTrue = isa<seq::Clocked>(curOp);
         if (!cur->delaysOut.size())
         {
-            cur->delaysOut.push_back(DelayPath{pn, Delay{0,0}, -1, -1});
+            cur->delaysOut.push_back(DelayPath{pn, 0, isTrue, -1, -1});
         }
-        parent->delaysOut.push_back(DelayPath{pn, Delay{pn->ppaInfo.slowDelay, pn->ppaInfo.fastDelay}, parInd, curInd});
-        pn->isTrueLeaf |= isa<seq::Clocked>(curOp);
+        parent->delaysOut.push_back(DelayPath{pn, pn->ppaInfo->begin()->delay, isTrue, parInd, curInd});
+        // pn->isTrueLeaf |= isa<seq::Clocked>(curOp);
         foundLeaves++;
         return cur;
     }
@@ -731,24 +1122,28 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, 
     // If there's still results we haven't traversed, continue traversing
     // This will happen when an op is visited the first time and possibly 
     // if it's revisisted WHILE it traverses other paths
-    if (cur->forwardIndices.size() < curOp->getNumResults())
+    HWModuleOp mop = llvm::dyn_cast<HWModuleOp>(curOp);
+    int numResults = mop ? mop.getNumInputPorts() : curOp->getNumResults();
+    if (cur->forwardIndices.size() < numResults)
     {
-        for (auto result : curOp->getResults()) 
+        for (int i = 0; i < numResults; i++)
         {
             // If we've already traversed this result, don't do so again
             // This prevents infinite loops
             // It's okay if we get back here though, it just means that theres a path
             // which we are traversing which passes through the module (this doesn't work
             // for combinational loops but we assume that those don't exist in hw modules)
-            if (std::find(cur->forwardIndices.begin(), cur->forwardIndices.end(), result.getResultNumber()) != cur->forwardIndices.end())
+            if (std::find(cur->forwardIndices.begin(), cur->forwardIndices.end(), i) != cur->forwardIndices.end())
             {
                 continue;
             }
-            cur->forwardIndices.push_back(result.getResultNumber());
-            for (auto & use : result.getUses())
+            cur->forwardIndices.push_back(i);
+
+            auto resultUses = mop ? mop.getArgumentForInput(i).getUses() : curOp->getResult(i).getUses();
+            for (auto & use : resultUses)
             {
                 Operation * owner = use.getOwner();
-                dfsPathForward(owner, use.getOperandNumber(), cur, result.getResultNumber());
+                dfsPathForward(owner, use.getOperandNumber(), cur, i);
             }
         }
     }
@@ -769,12 +1164,12 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, 
             {
                 continue;
             }
-            if (pathInternal.node->isTrueLeaf)
+            if (pathInternal.isTrue)
             {
-                Delay pathInternalD = pathInternal.delay;
+                double pathInternalD = pathInternal.delay;
 
                 // This is a path into the module
-                parent->delaysOut.push_back(DelayPath{cur->node, Delay{pathInternalD.slow, pathInternalD.fast}, parInd, pathInternal.fromInd});
+                parent->delaysOut.push_back(DelayPath{cur->node, pathInternalD, true, parInd, pathInternal.fromInd});
                 continue;
             }
             
@@ -785,22 +1180,21 @@ HWNodeDelaysPtr HWModulePPAModel::dfsPathForward(Operation * next, int nextInd, 
                 {
                     continue;
                 }
-                Delay pathInternalD = pathInternal.delay;
-                Delay poD = po.delay;
+                double pathInternalD = pathInternal.delay;
+                double poD = po.delay;
 
                 // This is a path through the module
-                parent->delaysOut.push_back(DelayPath{po.node, Delay{pathInternalD.slow + poD.slow, pathInternalD.fast + poD.fast}, parInd, po.toInd});
+                parent->delaysOut.push_back(DelayPath{po.node, pathInternalD + poD, po.isTrue, parInd, po.toInd});
             }
         }
         return cur;
     }
 
-    int curSlow = cur->node->ppaInfo.slowDelay; 
-    int curFast = cur->node->ppaInfo.fastDelay;
+    double curDelay = cur->node->ppaInfo->begin()->delay; 
     for (auto & po : cur->delaysOut) {
-        Delay poD = po.delay;
+        double poD = po.delay;
         int ind = po.toInd;
-        parent->delaysOut.push_back(DelayPath{po.node, Delay{poD.slow + curSlow, poD.fast + curFast}, parInd, ind});
+        parent->delaysOut.push_back(DelayPath{po.node, poD + curDelay, po.isTrue, parInd, ind});
     }
 
     return cur;
@@ -825,8 +1219,8 @@ void HWModulePPAModel::traverseFromRoot(Value & root, int ind) {
     {
         HWPathNodePtr pn = std::make_shared<HWPathNode>();
         pn->op = analyzedOp.getOperation();
-        pn->isTrueRoot = false;
-        pn->isTrueLeaf = false;
+        // pn->isTrueRoot = false;
+        // pn->isTrueLeaf = false;
         pn->ppaInfo = getPPAInfo(analyzedOp.getOperation());
 
         HWNodeDelaysPtr newBlock = std::make_shared<HWNodeDelays>();
@@ -852,27 +1246,29 @@ void HWModulePPAModel::traverseFromRoot(Value & root, int ind) {
 
 std::mutex debugWrLock;
 
-HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
+HWModulePPAModel::HWModulePPAModel(Operation * moduleOp, const HWPPAData * ppaDataPtr) : ppaData(ppaDataPtr)
 {
 
     HWModuleOp mop = dyn_cast<HWModuleOp>(moduleOp);
     if (!mop) {
         return;
     }
-    llvm::errs() << "MOP ADDRESS" << mop.getOperation() << '\n';
-    llvm::errs() << "PreMOP Address" << moduleOp << '\n';
+    // llvm::errs() << "MOP ADDRESS" << mop.getOperation() << '\n';
+    // llvm::errs() << "PreMOP Address" << moduleOp << '\n';
     analyzedOp = mop;
 
     for (size_t i = 0; i < mop.getNumInputPorts(); i++)
     {
         BlockArgument res = mop.getArgumentForInput(i);
-        inpsList.push_back(static_cast<Value>(res));        
+        inpsList.push_back(static_cast<Value>(res));
     }
+
+    HWNodeDelaysPtr nullPtr = nullptr;
+    dfsPathForward(analyzedOp, -1, nullPtr, -1);
 
     mop->walk([&](Operation * op) {
 
         seq::Clocked clockedOp = dyn_cast<seq::Clocked>(op);
-        HWNodeDelaysPtr nullPtr = nullptr;
         if (clockedOp)
         {
             dfsPathForward(op, -1, nullPtr, -1);
@@ -895,7 +1291,6 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
     });
 
     
-    llvm::errs() << "[PPA] Module " << mop.getName() << '\n';
     // llvm::errs() << "[PPA] have " << blocks.size() << " blocks\n";
     // llvm::errs() << "[PPA] have " << foundLeaves << " found leaves\n";
     // llvm::errs() << "[PPA] have " << leafBlocks.size() << " blocks leaves\n";
@@ -927,6 +1322,10 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
     //     }
     // }
 
+    debugWrLock.lock();
+
+    llvm::errs() << "[PPA] Module " << mop.getName() << '\n';
+
     for (auto & block : blocks) {
 
         if (isa<HWModuleOp>(block.second->node->op)) {
@@ -944,28 +1343,30 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
 
         for (auto & pi : block.second->delaysIn) {
             if (isa<HWModuleOp>(pi.node->op)) {
-                llvm::errs() << "\n    delayIn from module input is: " << pi.delay.fast << '\n';
+                llvm::errs() << "\n    trueroot: " << pi.isTrue << "    delayIn from module input is: " << pi.delay << '\n';
                 continue;
             }
-            llvm::errs() << "\n    delayIn from " << *pi.node->op;
+            llvm::errs() << "\n    trueroot: " << pi.isTrue << "    delayIn from " << *pi.node->op;
             // if (pi.first->op) { 
             //     pi.first->op->dumpPretty();
             // } else {
             //     llvm::errs() << "mod inp";
             // }
-            llvm::errs() << " is: " << pi.delay.fast << '\n';
+            llvm::errs() << " is: " << pi.delay << '\n';
         }
         for (auto & po : block.second->delaysOut) {
-            llvm::errs() << "\n    delayOut to " << *po.node->op;
+            llvm::errs() << "\n    trueleaf: " << po.isTrue << "    delayOut to " << *po.node->op;
             // if (po.first->op) {
             //     po.first->op->dumpPretty();
             // } else {
             //     llvm::errs() << "mod out";
             // }
-            llvm::errs() << " is: " << po.delay.fast << '\n';
+            llvm::errs() << " is: " << po.delay << '\n';
         }
     }
     llvm::errs() << "\n\n\n";
+
+    debugWrLock.unlock();
     
     // debugWrLock.unlock();
 
@@ -976,7 +1377,7 @@ HWModulePPAModel::HWModulePPAModel(Operation * moduleOp)
 
     // Clocked objects have results which are roots and inputs which are leaves
 
-
+    finished = true;
 
 }
 
@@ -1158,36 +1559,154 @@ void HWPowerAnalyzePass::walkOps()
     auto circuitOp = getOperation();
     llvm::errs() << "[PowerAnalyze] Analyzing circuit: " << circuitOp.getOperationName() << "\n";
 
-
-
     circuitOp->walk([&](Operation *op) {
         llvm::errs() << "[PowerAnalyze] Found operation: " << op->getName() << "\n";
     
         op->getParentOp();
     });
 
-    
-
     // circuitOp->walk(FnT &&callback);
 }
 
-HWPowerAnalyzePass * thePass;
+size_t HWPowerAnalyzePass::indexFromArgs(uint16_t in1Width, uint16_t auxWidth)
+{
+    return static_cast<size_t>(in1Width) << 16 | static_cast<size_t>(auxWidth);
+}
 
+void HWPowerAnalyzePass::parsePPAJson(const std::string &jsonPath, HWPPAData &ppaData) {
+    std::ifstream in(jsonPath);
+    if (!in) {
+        llvm::errs() << "[HWPowerAnalyze] Could not open JSON file: " << jsonPath << "\n";
+        return;
+    }
+    std::string jsonText((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(jsonText);
+    if (!parsed) {
+        llvm::errs() << "[HWPowerAnalyze] Failed to parse JSON: " << jsonPath << "\n";
+        llvm::handleAllErrors(parsed.takeError(), [](const llvm::ErrorInfoBase &EIB) {
+            EIB.log(llvm::errs());
+        });
+        llvm::errs() << "\n";
+        return;
+    }
+    llvm::json::Object *rootObj = parsed->getAsObject();
+    if (!rootObj) {
+        llvm::errs() << "[HWPowerAnalyze] JSON root is not an object\n";
+        return;
+    }
+    for (auto &topKV : *rootObj) {
+        const std::string &topKey = topKV.first.str();
+        ppaData.data.emplace(topKey, HWPPAGroup());
+        HWPPAGroup & grp = ppaData.data[topKey];
+        const llvm::json::Array *arr = topKV.second.getAsArray();
+        if (!arr) continue;
+        std::map<size_t, HWPPASetPtr> infos;
+        // 
+        for (const auto &elem : *arr) {
+            const llvm::json::Object *obj_par = elem.getAsObject();
+            const llvm::json::Object *obj = obj_par->getObject("properties");
+            if (!obj) continue;
+            HWPPAInfo info;
+            auto parseDouble = [](const llvm::json::Object *obj, const char *key) -> double {
+                // Prefer numeric if present
+                if (auto v = obj->getNumber(key))
+                    return *v;
+                if (auto i = obj->getInteger(key))
+                    return static_cast<double>(*i);
+                // Fallback: parse string possibly with unit suffixes
+                if (auto s = obj->getString(key)) {
+                    std::string tmp = s->str();
+                    const char *begin = tmp.c_str();
+                    char *end = nullptr;
+                    double val = std::strtod(begin, &end);
+                    if (end != begin)
+                        return val; // parsed at least something
+                }
+                return 0.0;
+            };
+            info.delay = parseDouble(obj, "Delay");
+            info.area = parseDouble(obj, "Area");
+            info.lkgpwr = parseDouble(obj, "LkgPwr");
+            double swg = parseDouble(obj, "SwgEng");
+            double inte = parseDouble(obj, "IntEng");
+            info.dynengy = swg + inte;
+            
+            // TODO GRAB WIDTH FROM JSON
+            size_t width = static_cast<size_t>(parseDouble(obj, "width"));
+            size_t auxWidth = 0;
+
+            if (!width) 
+            {
+                width = static_cast<size_t>(parseDouble(obj, "width_in1"));
+                auxWidth = static_cast<size_t>(parseDouble(obj, "width_in2"));
+            }
+
+            if (!width)
+            {
+                width = static_cast<size_t>(parseDouble(obj, "in_width"));
+                auxWidth = static_cast<size_t>(parseDouble(obj, "aux_width"));
+            }
+
+            info.in1Width = width;
+            info.auxWidth = auxWidth;
+            grp.addInfo(info);
+        }
+    }
+}
 
 void HWPowerAnalyzePass::runOnOperation() 
 {
-    thePass = this;
-    debugWrLock.lock();
+    llvm::Timer watch;
+    watch.startTimer();
+
+    HWPPAData * ppaData = new HWPPAData();
+    parsePPAJson("/scratch/jtoubes/chisel-learning/carbon/asap7-dc-catapult.json", *ppaData);
+
+    // Test prints: print first 10 instances for each top-level key
+    for (const auto &kv : ppaData->data) {
+        llvm::errs() << "[PPA JSON] Key: " << kv.first << "\n";
+        int count = 0;
+        llvm::errs() << "[PPA JSON] InfoSetVec size: " << kv.second.m_infoSets.size() << "\n";
+        for (const auto &infoSetVec : kv.second.m_infoSets) {
+            llvm::errs() << "[PPA JSON] InfoSetVec size: " << infoSetVec.size() << "\n";
+            for (auto & infoSet : infoSetVec) {
+                llvm::errs() << "[PPA JSON] InfoSet size: " << infoSet->size() << "\n";
+                for (auto & info : *infoSet) {
+                    llvm::errs() << "  Instance " << count << ": delay=" << info.delay
+                        << ", area=" << info.area
+                        << ", lkgpwr=" << info.lkgpwr
+                        << ", dynengy=" << info.dynengy << "\n";
+                }
+                if (++count >= 10) break;
+            }
+        }
+    }
 
     llvm::errs() << "[PowerAnalyze] Running power analysis pass\n";
     llvm::errs().flush();
 
+
+
     mlir::ModuleOp topOp = getOperation();
+
+    llvm::SmallVector<std::thread *> tPool;
     topOp->walk([&](HWModuleOp modOp) {
 
-        HWModulePPAModel & a = HWModulePPAModel::getModel(modOp);
+        tPool.push_back(new std::thread(HWModulePPAModel::getModel, modOp, ppaData));
+
+        // HWModulePPAModel & a = HWModulePPAModel::getModel(modOp);
 
     });
+
+    for (std::thread * t : tPool) {
+        t->join();
+    }
+    watch.stopTimer();
+    llvm::errs() << "[PowerAnalyze] TIMING INFO\n"; 
+    llvm::errs() << "[PowerAnalyze] system time" << watch.getTotalTime().getSystemTime() << "\n";
+    llvm::errs() << "[PowerAnalyze] user time" << watch.getTotalTime().getUserTime() << "\n";
+    llvm::errs() << "[PowerAnalyze] process time" << watch.getTotalTime().getProcessTime() << "\n";
+    llvm::errs() << "[PowerAnalyze] wall time" << watch.getTotalTime().getWallTime() << "\n";
 
     // Block * topBlock = getOperation()->getBlock();
     // for (Operation & module : topBlock->getOperations())
@@ -1200,7 +1719,6 @@ void HWPowerAnalyzePass::runOnOperation()
     //     }
     // }
     
-    debugWrLock.unlock();
 
     // getAnalysis<typename AnalysisT>()
     // getAnalysis<HWModulePPAModel>();
@@ -1251,8 +1769,7 @@ void HWPowerAnalyzePass::runOnOperation()
 
 
 
-
-
+    delete ppaData;
 
 }
 
